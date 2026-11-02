@@ -155,6 +155,7 @@ enum CMD_SET
     GET_PinSource           = 0xA,
     SET_CameraClk           = 0xB,
     SET_PIVParams           = 0xC,
+    ENABLE_PIV              = 0xD,
     GET_FirmwareVersion     = 0xFD, // this is technically different from whats in the communications protocol.rtf (0xD) but the TimingBoxXMOS.cpp file wants 0xFD
     IRQ_DumpLog             = 0xFE,
     IRQ_HARDRESET           = 0xFF,
@@ -273,11 +274,15 @@ int BytesToReceive(enum CMD_SET command)
             break;
  
         case SET_CameraClk:
-            bytesToReceive = 4;
+            bytesToReceive = 5;
             break;
  
         case SET_PIVParams:
             bytesToReceive = 19;
+            break;
+
+        case ENABLE_PIV:
+            bytesToReceive = 3;
             break;
 
         default:
@@ -286,6 +291,14 @@ int BytesToReceive(enum CMD_SET command)
     };
     return bytesToReceive;
 }
+static uint32_t read_be32(const unsigned char *p)
+{
+    return ((uint32_t)p[0] << 24)
+         | ((uint32_t)p[1] << 16)
+         | ((uint32_t)p[2] << 8)
+         | (uint32_t)p[3];
+}
+
 uint32_t remapPinMask(unsigned char oldPinMask)
 {
     // Since pins are not consecutive I need to convert the 4bit pin mask into a 32 bit word
@@ -388,17 +401,26 @@ void CommandParser(unsigned char *ptrDataReceived, unsigned char *ptrDataRespons
 
         case SET_CameraClk:
             int clockIdx = ptrDataReceived[1];
-            pianolaCameraClock[clockIdx] = ptrDataReceived[2] << 16 | ptrDataReceived[3] << 8 | ptrDataReceived[4] & 0xFF;
+            if (clockIdx < sizeof(pianolaCameraClock) / sizeof(pianolaCameraClock[0]))
+            {
+                pianolaCameraClock[clockIdx] = ptrDataReceived[2] << 16 | ptrDataReceived[3] << 8 | ptrDataReceived[4] & 0xFF;
+            }
             break;
 
         case SET_PIVParams:
-        // double check order with xmos code - likely not a problem until farther down the line
             pivIdx = ptrDataReceived[1] & 0xFF;
-            pivIntervalLaserPulses = ptrDataReceived[5] << 24 | ptrDataReceived[4] << 16 | ptrDataReceived[3] << 8| ptrDataReceived[2] & 0xFF;
-            pivDuratonPulsePair  = ptrDataReceived[9] << 24 | ptrDataReceived[8] << 16 | ptrDataReceived[7] << 8| ptrDataReceived[6] & 0xFF;
-            pivIntervalPulseToExp  = ptrDataReceived[13] << 24 | ptrDataReceived[12] << 16 | ptrDataReceived[11] << 8| ptrDataReceived[10] & 0xFF;
-            pivCameraExposure =  ptrDataReceived[17] << 24 | ptrDataReceived[16] << 16 | ptrDataReceived[15] << 8| ptrDataReceived[14] & 0xFF;
+            // Network byte order; durations remain in XMOS 10 ns units.
+            pivIntervalLaserPulses = read_be32(ptrDataReceived + 2);
+            pivDuratonPulsePair = read_be32(ptrDataReceived + 6);
+            pivIntervalPulseToExp = read_be32(ptrDataReceived + 10);
+            pivCameraExposure = read_be32(ptrDataReceived + 14);
+            // Exposure input bit index, not a bit mask.
             pivCameraMonitorIdx = ptrDataReceived[18] & 0xFF;
+            break;
+
+        case ENABLE_PIV:
+            // Consume channel and enable parameters to preserve packet framing.
+            // PIV pulse generation is not implemented, so this is a no-op.
             break;
 
         case GET_FirmwareVersion:
