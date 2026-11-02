@@ -208,31 +208,15 @@ uint32_t getPianolaTime()
 
 int isTimeInFuture(uint32_t currentTime, uint32_t proposedTime)
 {
-    // Determine if a given time us in the past based on the "timerafter" function defined in pages 21-22 of the xmos manual.
-    // Theres a difference in how my clock deals with 24bits of precision. Time in the xmos board is a 32bit uint and to simulate 32bits of precision 
-    // the first 8 bits are discarded / ignored. 
-    // My clock just populates bits 0-23 of a 32bit uint so what I now need to do is just shift my time values to replicate the behaviour of the xmos board.
-    int32_t currentTime32bit = (currentTime << 8) & 0xFFFFFFFF;
-    int32_t proposedTime32bit = (proposedTime << 8) & 0xFFFFFFFF;
-    int32_t timeInPastRange[2] =    {   currentTime32bit - (1<<31), 
-                                        currentTime32bit -   1 
-                                    };
-
-    // check if proposedTime is in the past
-    int timeIsInFuture = !((proposedTime32bit >= timeInPastRange[0]) && (proposedTime32bit <= timeInPastRange[1]));
-    return timeIsInFuture;
+    // Compare modulo 2^24 using the XMOS half-range convention.
+    uint32_t delta = (proposedTime - currentTime) & 0xFFFFFFu;
+    return delta != 0 && delta < 0x800000u;
 }
 int shouldRunPianolaSoon(uint32_t currentTime, uint32_t proposedTime)
 {
-    // is fire time in future
-    int fireTimeInFuture =  isTimeInFuture(currentTime, proposedTime);
-
-    // is currentTime withing the firetime threshold. i.e is currentTime + threshold after the proposed fire time
-    int fireTimeWithinThreshold = isTimeInFuture(proposedTime, (currentTime + pianolaFireTimeThresholdTicks) % 0xFFFFFF);
-
-    // if both are true we should fire now
-    int readyToFire = (fireTimeInFuture && fireTimeWithinThreshold);
-    return readyToFire;
+    // Include the target tick in the advance window, including across wraparound.
+    uint32_t delta = (proposedTime - currentTime) & 0xFFFFFFu;
+    return delta <= (uint32_t)pianolaFireTimeThresholdTicks;
 }
 
 // ===============================================================================
