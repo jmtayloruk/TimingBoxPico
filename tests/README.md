@@ -103,6 +103,9 @@ or extracted as test-specific copies.
   has a timeout.
 - GPIO/PIO configuration recording and range validation. UART calls record the
   simulated core context; this checks ownership, not real concurrent execution.
+  The actual `core0Step()` is stepped independently from `pianolaManagerStep()`.
+  Startup tests verify polling runs and UART interrupts are disabled. TX can be
+  paused while RX progresses; full command/reply queues exercise retention.
 
 The generated native PIO headers contain the **actual C SDK initialisers embedded
 in the .pio files**. The real firmware startup runs up to core launch; its settings run against the
@@ -195,3 +198,147 @@ Keep assertions tied to the protocol or safety requirements, not implementation
 variable names where an observable result is available. Explain any permitted
 alternatives. Every fake-peripheral extension should remain smaller than the
 hardware behaviour it replaces and should fail on unsupported operations.
+
+## Connected-Pico serial stress tests
+
+A separate script exercises the real serial connection. It does not use or
+replace the native peripheral shim, install firmware, or require Python packages.
+It uses the standard-library POSIX tty interface on macOS/Linux at 115200 8N1.
+
+From the TimingBoxPico directory, first list candidate ports (no port is opened):
+
+```sh
+python3 tests/hardware_stress.py --list-ports
+```
+
+Close the SPIM application/other serial clients, then choose the
+FTDI device. The script claims exclusive tty access where supported. This is a
+test of a device you can reprogram: it replaces and runs its pianola. The default
+pattern bit is 4, the onboard GP25 LED in the current Pico firmware. Other bits
+are low in the uploaded patterns. Disconnect attached equipment if its mapping
+is uncertain. The firmware/version and fixed-source readback are checked before
+running patterns; they do not prove physical wiring or identify a device uniquely.
+
+Omit `--port` to see a numbered list of all `/dev/cu.usbserial*` ports and choose
+one interactively (even if only one is available). Enter `q` to cancel without
+opening a device. If no matching ports are found, an error suggests connecting
+the device or using `--port`. Unattended runs should always specify `--port`.
+
+```sh
+python3 tests/hardware_stress.py --interactive
+python3 tests/hardware_stress.py --port /dev/cu.usbserial-XXXX
+python3 tests/hardware_stress.py --port /dev/cu.usbserial-XXXX --seconds 60 --json /tmp/pico-stress.json
+python3 tests/hardware_stress.py --port /dev/cu.usbserial-XXXX --interactive
+```
+
+The automatic cases check:
+
+- A reset/reframing train followed by a firmware-version query.
+- Isolated version/time queries, with **no wake-up command or retry** while a
+  response is pending. A reply stranded until the next RX interrupt fails.
+- Exact reply lengths and a short quiet interval to detect unsolicited bytes.
+- Clock advancement against broad host-time bounds. USB/OS latency prevents this
+  being an absolute-frequency calibration; suspicious timing is a warning.
+- Fixed source readback for the chosen logical LED output.
+- Back-to-back no-response uploads of 3, 32 and 256 entries, followed by run,
+  stop and query commands. The protocol has no sequence readback: this checks
+  subsequent replies and responsiveness, not complete upload contents.
+- Acceptance of scheduled/replacement starts, restart and stop, followed by
+  queries. Physical execution/cancellation is not established by these replies.
+- A complete upload packet fragmented across two writes, 20 ms apart. This does
+  not deliberately abandon a packet, and does not establish nonblocking service.
+- Seeded mixed queries/starts/stops while repeating playback is requested. No
+  concurrent writers or interleaved packets are used. A seed reproduces the
+  chosen actions, not nondeterministic USB timing.
+
+Default stress duration is 10 seconds. `--seconds` changes that phase only; the
+setup/case/cleanup time is additional. `--timeout` bounds each reply/write
+(default 0.5 s). `--lead-ms` defaults to 10 ms for automated scheduling tests. Rejections with a short lead can
+be due to host/USB delay as well as firmware; the error prints target and reported
+time. `--strict-timing` makes timing warnings affect exit status. Reply latency
+statistics are host/USB round trips, not output latency. The JSON report includes
+case results, all transmitted/received bytes, timestamps, seed and cleanup result.
+
+A framing error, absent/short response, or transport error stops further cases:
+remaining cases are SKIP, rather than interpreting later bytes at uncertain
+boundaries. There is no automatic retry that might hide the defect. Cleanup
+attempts an explicit low sequence then stop when the stream remains trusted;
+with a broken stream it only attempts stop. Neither path proves output levels.
+Check/power-cycle the device if cleanup fails. Ctrl-C attempts cleanup and returns
+130. Other failing cases return 1, argument errors return 2, and otherwise the
+script returns 0. Running the existing firmware may expose the known UART bugs.
+
+### Optional human LED observations
+
+`--interactive` adds four separately labelled HUMAN checks, with y/n/skip answers:
+
+Before **each** check, the script stops previous activity, executes an explicit
+low pattern, prints the complete instructions, and waits for Return. The LED
+should be OFF while you read. Enter `n` if the starting state is wrong or `s` to
+skip without starting. Once you press Return, watch only the LED: there are no
+mid-window questions or new instructions. After viewing, the script stops playback
+and asks retrospective questions.
+
+1. A burst-uploaded, scheduled 1 Hz pattern, ON for roughly 25% of each cycle.
+   After Return there is about half a second OFF, then five seconds of flashing.
+   This visual check uses a fixed 500 ms lead, independent of `--lead-ms`, so USB
+   serial latency does not normally prevent the waveform being observed. It is
+   not a test of accepting a short-lead request.
+2. A fresh blinking pattern for four seconds, followed by stop; observe three
+   more seconds of steady output. Steady ON or OFF is allowed.
+3. Replace a 2-second pending start with a 6-second one. Observe the whole
+   ten-second window without looking back at the terminal: OFF for about six
+   seconds, then blinking. Both questions are asked afterwards, so the prompt
+   itself cannot obscure whether the original start was cancelled.
+4. A **one-shot**, not repeating, four-second ON entry followed by OFF. Restart
+   after three seconds: expect about seven seconds of continuous ON, then OFF
+   for the rest of the eleven-second viewing window. An early OFF near four
+   seconds, a gap or relighting is a failure. This deliberately replaces the
+   ambiguous repeating two-seconds-ON/two-seconds-OFF check.
+
+Watch the **onboard LED**, not the green/blue state indicator. Interactive checks
+require the current bit-4 onboard mapping. They take roughly forty seconds plus
+preparation and answer time. 'n' records a functional human-observed failure, 's'
+records SKIP, and EOF records a failed observation. Human passes supplement,
+rather than upgrade, automated serial passes. They are useful for gross waveform/
+control errors, but cannot reveal microsecond glitches, exact duty cycle, clock
+accuracy or short-entry starvation. An analyser/second Pico is still appropriate
+for those.
+
+### Offline tests of the hardware runner
+
+These do **not** connect to a Pico. They validate the script's own protocol
+construction, timeouts/no-retry behaviour, fragmented/extra/short replies,
+classification, JSON report, cleanup and POSIX transport through a pseudo-terminal:
+
+```sh
+python3 -B -m unittest discover -s tests -p 'test_hardware_stress.py' -v
+```
+
+## UART ownership implementation
+
+Core 0 exclusively receives/transmits UART bytes from `core0Step()` in its main
+loop. There is no UART IRQ handler and core 1 never touches UART. Each step handles
+at most 32 RX and 32 TX bytes; incomplete packets are retained without waiting.
+Command and response queues each hold 32 records. A complete command is retained
+if its queue is full. Core 1 similarly retains a reply if responseQ is full and
+continues playback stepping while waiting to publish it. No UART-path heap
+allocation is needed. Debug dumps travel as ordered queue requests and are
+transmitted incrementally, with zero-filled unused records.
+
+Backpressure is finite: this does not make an unbounded host stream lossless.
+If core 1 ceases making progress long enough, the hardware UART RX FIFO can still
+overrun; no RTS/CTS or new protocol acknowledgement has been introduced. Likewise
+an abandoned partial packet is retained, not silently timed out. A hardware
+watchdog and a more explicit serial recovery protocol are separate work.
+
+Focused native checks:
+
+```sh
+python3 tests/run_tests.py --filter uart
+python3 tests/run_tests.py --filter fragmented_packet
+python3 tests/run_tests.py --filter upload_burst
+```
+
+These are deterministic checks of the actual polling/queue code, not a proof
+about physical interrupt latency. Rerun the connected burst test after flashing.

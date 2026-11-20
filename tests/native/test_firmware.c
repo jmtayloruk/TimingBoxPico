@@ -14,7 +14,7 @@ static void *poison_malloc(size_t n) { void *p=malloc(n); if(p) memset(p,0xA5,n)
 #include "fixtures.h"
 #define CHECK(c,...) do { if(!(c)) { fprintf(stderr,__VA_ARGS__); fputc('\n',stderr); exit(1); } } while(0)
 static void setup(void) {
-    queue_init(&commandQ,32,1); queue_init(&responseQ,32,1); queue_init(&dumpDebugQ,32,32);
+    queue_init(&commandQ,32,commandQDepth); queue_init(&responseQ,32,responseQDepth); queue_init(&dumpDebugQ,32,32);
     pianolaStatus=READY; context=0;
 }
 /* Host packets are passed through the actual UART receiver, then the actual
@@ -24,8 +24,8 @@ static void receive_bytes(const unsigned char *p,unsigned n) {
     CHECK(n<=sizeof(rx),"Test input too large"); memcpy(rx,p,n);rx_pos=0;rx_count=n;
 }
 static void step(void) { context=1; pianolaManagerStep(); context=0; }
-static void service(void) { context=0; uartHandlerCore0(); }
-static void send_packet(const unsigned char *p,unsigned n) {receive_bytes(p,n);service();step();service();}
+static void service(void) { context=0; core0Step(); }
+static void send_packet(const unsigned char *p,unsigned n) {receive_bytes(p,n);service();step();service();for(unsigned i=0;i<40 && uartTxUsed<uartTxLength;i++) service();}
 #define SEND(...) do { const unsigned char packet_bytes[]={__VA_ARGS__};send_packet(packet_bytes,sizeof(packet_bytes)); } while(0)
 static void entry(unsigned address,unsigned mask,uint32_t duration) {
     SEND(1,address,mask,duration>>16,duration>>8,duration);
@@ -303,8 +303,96 @@ static void refill_experiment(unsigned short_ticks) {
 static void test_refill_four(void) { refill_experiment(4); }
 static void test_refill_one(void) { refill_experiment(1); }
 
+// Ownership is not enough: execute the actual startup through its first core-0
+// foreground iteration, verifying polling exists and no UART IRQ can reenter it.
+static void test_core0_foreground(void) {
+    startup_through_core0=true;trap_enabled=true;
+    if(setjmp(trap)==0) firmware_main();
+    trap_enabled=false;
+    CHECK(!strcmp(trap_reason,"core-0 foreground loop reached"),"Did not reach core-0 polling loop");
+    CHECK(!irq_handler_registrations && !uart_irq_enabled && !cpu_uart_irq_enabled,"UART polling still has a competing interrupt handler");
+}
+static void test_idle_response_poll(void) {
+    const unsigned char query[]={0xFD};receive_bytes(query,1);service();
+    CHECK(!tx_count,"Reply existed before command was processed");step();
+    for(unsigned i=0;i<10 && tx_count<2;i++) service();
+    CHECK(tx_count==2 && tx[0]==6 && tx[1]==6,"Isolated query requires another received byte to get its reply");
+    CHECK(!uart_context_errors,"Reply processing accessed UART from core 1");
+}
+static void test_tx_backpressure(void) {
+    tx_capacity=0;SEND(0xFD);
+    CHECK(!tx_count,"Blocked TX must not send bytes");
+    const unsigned char partial[]={1,7};receive_bytes(partial,2);service();
+    CHECK(rx_pos==2,"Blocked TX prevented RX progress");
+    tx_capacity=sizeof(tx);service();
+    CHECK(tx_count==2 && tx[0]==6 && tx[1]==6,"Paused TX reply was lost/corrupted");
+    const unsigned char rest[]={1,0,0,4};receive_bytes(rest,4);service();step();
+    CHECK((uint32_t)pianola[7]==4,"Partial command damaged while TX was blocked");
+}
+static void test_rx_backpressure(void) {
+    unsigned char filler[32]={4,0};for(unsigned i=0;i<commandQDepth;i++) CHECK(queue_try_add(&commandQ,filler),"Cannot fill command queue");
+    const unsigned char packet[]={1,7,1,0,0,4};receive_bytes(packet,6);service();
+    CHECK(uartRxUsed==6 && (uint32_t)pianola[7]==0,"Full queue did not retain completed command");
+    step();service();
+    for(unsigned i=0;i<commandQDepth+2;i++) step();
+    CHECK((uint32_t)pianola[7]==4,"Retained command lost after queue space became available");
+}
+static void test_response_backpressure(void) {
+    // Responses saturate while TX is unavailable. No command gets a duplicate
+    // or missing reply after the consumer resumes. Playback can still step.
+    tx_capacity=0;
+    for(unsigned i=0;i<responseQDepth+3;i++) SEND(0xFD);
+    tx_capacity=sizeof(tx);
+    for(unsigned i=0;i<200;i++) {service();step();}
+    CHECK(tx_count==2*(responseQDepth+3),"Response backpressure lost/duplicated data: expected %u bytes, got %u",2*(responseQDepth+3),tx_count);
+    for(unsigned i=0;i<tx_count;i++) CHECK(tx[i]==6,"Backpressured response byte %u is wrong",i);
+}
+static void test_serial_interleavings(void) {
+    const unsigned char packets[]={1,0,1,0,0,4,1,1,2,0,0,8,2,1,0xFD,8};
+    // Byte-at-a-time delivery with producer/consumer bursts in a reproducible
+    // order catches framing and progress bugs beyond specific known packets.
+    uint32_t seed=0x87654321;
+    for(unsigned i=0;i<sizeof(packets);i++) {
+        receive_bytes(packets+i,1);service();seed=seed*1664525u+1013904223u;
+        for(unsigned j=0;j<(seed%4);j++) step();
+    }
+    for(unsigned i=0;i<40;i++) {step();service();}
+    CHECK((uint32_t)pianola[0]==4 && (uint32_t)pianola[1]==8 && pianolaFinalPosition==1,"Alternating core schedules corrupted programming commands");
+    CHECK(tx_count==5 && tx[0]==6 && tx[1]==6,"Alternating core schedules lost or reordered replies");
+    CHECK(!block_on_empty && !uart_context_errors,"Fragmented/interleaved delivery caused blocking or wrong-core access");
+}
+
+static void test_full_wire_upload(void) {
+    unsigned char wire[256*6+3];unsigned n=0;
+    for(unsigned i=0;i<256;i++) {
+        uint32_t d=4+i;unsigned char p[]={1,i,i,d>>16,d>>8,d};
+        memcpy(wire+n,p,sizeof(p));n+=sizeof(p);
+    }
+    wire[n++]=2;wire[n++]=255;wire[n++]=0xFD;
+    receive_bytes(wire,n);
+    // Producer gets bursts of foreground iterations; consumer gets only one.
+    // This fills the queues and exercises retention without a copied parser.
+    for(unsigned i=0;i<1000;i++) {for(unsigned j=0;j<3;j++) service();step();}
+    for(unsigned i=0;i<256;i++) CHECK((uint32_t)pianola[i]==4+i && (pianola[i]>>32)==expected_mask(i),"Full wire upload corrupted entry %u",i);
+    CHECK(rx_pos==rx_count && pianolaFinalPosition==255 && tx_count==2 && tx[0]==6 && tx[1]==6,"Full upload lost end marker or following reply");
+}
+static void test_debug_wire_order(void) {
+    const unsigned char commands[]={0xFE,0xFD};receive_bytes(commands,2);service();step();step();
+    for(unsigned i=0;i<80;i++) service();
+    CHECK(tx_count==1026 && tx[1024]==6 && tx[1025]==6,"Debug dump and subsequent reply interleaved or were lost");
+    CHECK(!uart_context_errors,"Debug request caused UART access from core 1");
+}
+
 typedef struct {const char *name,*area;void (*fn)(void);} test;
 static const test tests[]={
+ {"full_wire_upload","UART / full 256-entry upload with asymmetric core scheduling",test_full_wire_upload},
+ {"debug_reply_wire_order","UART / complete debug dump before next response",test_debug_wire_order},
+ {"core0_foreground","UART / actual foreground loop, no interrupt reentrancy",test_core0_foreground},
+ {"isolated_reply_poll","UART / response without any additional incoming byte",test_idle_response_poll},
+ {"tx_backpressure","UART / paused TX permits fragmented RX progress",test_tx_backpressure},
+ {"rx_backpressure","UART / retain command while command queue is full",test_rx_backpressure},
+ {"response_backpressure","UART / retain replies while response queue is full",test_response_backpressure},
+ {"serial_interleavings","UART / fragmented bytes and varied core-step schedules",test_serial_interleavings},
  {"timing_refill_four_ticks","Timing model / isolated four-tick entry, four-tick service interval",test_refill_four},
  {"timing_refill_one_tick","Timing model / isolated one-tick entry, four-tick service interval",test_refill_one},
  {"packet_lengths","Protocol / packet lengths and version reply",test_protocol_lengths},

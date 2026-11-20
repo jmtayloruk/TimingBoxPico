@@ -45,9 +45,19 @@ pico_generate_pio_header(picoTimingBoxFirmware ${CMAKE_CURRENT_LIST_DIR}/pianola
 pico_generate_pio_header(picoTimingBoxFirmware ${CMAKE_CURRENT_LIST_DIR}/pianola24bitClock.pio)
 # Modify the below lines to enable/disable output over UART/USB
 pico_enable_stdio_uart(picoTimingBoxFirmware 0)
-# pico_enable_stdio_usb can be set to 1 for debugging, but should not be left like that
-# (could lead to timeouts if nobody is listening on the other end)
-pico_enable_stdio_usb(picoTimingBoxFirmware 0)
+# Optional development build: native USB exposes the SDK picotool reset interface.
+# Keep production USB-off timing unchanged unless explicitly requested at configure.
+option(TIMINGBOX_USB_FLASHING "Enable native USB for software-assisted flashing" OFF)
+if(TIMINGBOX_USB_FLASHING)
+    pico_enable_stdio_usb(picoTimingBoxFirmware 1)
+    target_compile_definitions(picoTimingBoxFirmware PRIVATE
+        PICO_STDIO_USB_CONNECT_WAIT_TIMEOUT_MS=0
+        PICO_STDIO_USB_STDOUT_TIMEOUT_US=0
+        PICO_STDIO_USB_ENABLE_RESET_VIA_VENDOR_INTERFACE=1
+        PICO_STDIO_USB_ENABLE_RESET_VIA_BAUD_RATE=1)
+else()
+    pico_enable_stdio_usb(picoTimingBoxFirmware 0)
+endif()
 
 # Add the standard library to the build
 target_link_libraries(picoTimingBoxFirmware

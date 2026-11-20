@@ -30,6 +30,9 @@ static uint32_t gpio_levels, gpio_directions, gpio_functions, output_base, outpu
 static bool active;
 static uint32_t active_duration, active_mask;
 static unsigned clock_requests;
+static unsigned irq_handler_registrations, uart_irq_enabled, cpu_uart_irq_enabled;
+static bool startup_through_core0;
+static unsigned tx_capacity = 16384;
 static jmp_buf trap;
 static bool trap_enabled;
 static const char *trap_reason;
@@ -63,11 +66,11 @@ static unsigned char uart_getc(int id) {
     if(rx_pos==rx_count) { block_on_empty++; fault("UART read would block awaiting a missing packet byte"); }
     return rx[rx_pos++];
 }
-static void uart_write_blocking(int id,const unsigned char *p,unsigned n) {
-    (void)id;
-    if(context!=0) uart_context_errors++;
-    if(n>sizeof(tx)-tx_count) fault("UART response exceeds capture buffer");
-    memcpy(tx+tx_count,p,n); tx_count+=n;
+static bool uart_is_writable(int id) { (void)id; if(context!=0) uart_context_errors++; return tx_count<tx_capacity; }
+static void uart_putc_raw(int id,unsigned char byte) {
+    (void)id;if(context!=0) uart_context_errors++;
+    if(tx_count>=tx_capacity || tx_count>=sizeof(tx)) fault("UART write would block");
+    tx[tx_count++]=byte;
 }
 static bool pio_sm_is_tx_fifo_empty(PIO p,unsigned sm) { (void)p; return sm==0 ? fifo_level==0 : true; }
 static void pio_sm_put(PIO p,unsigned sm,uint32_t value) {
@@ -111,15 +114,15 @@ static void sleep_us(unsigned n) { (void)n; }
 static void uart_init(int id,unsigned baud) { (void)id;(void)baud; }
 static void uart_set_hw_flow(int id,bool a,bool b) { (void)id;(void)a;(void)b; }
 static void uart_set_format(int id,unsigned a,unsigned b,unsigned c) { (void)id;(void)a;(void)b;(void)c; }
-static void irq_set_exclusive_handler(unsigned irq,void (*fn)(void)) { (void)irq;(void)fn; }
-static void irq_set_enabled(unsigned irq,bool v) { (void)irq;(void)v; }
-static void uart_set_irq_enables(int id,bool a,bool b) { (void)id;(void)a;(void)b; }
+static void irq_set_exclusive_handler(unsigned irq,void (*fn)(void)) { (void)irq;(void)fn;irq_handler_registrations++; }
+static void irq_set_enabled(unsigned irq,bool v) { (void)irq;cpu_uart_irq_enabled=v; }
+static void uart_set_irq_enables(int id,bool a,bool b) { (void)id;uart_irq_enabled=a||b; }
 static const int pinDriver_program=0, pianolaClock_program=1;
 static bool pio_claim_free_sm_and_add_program_for_gpio_range(const int *a,PIO *p,uint *sm,uint *o,uint b,uint n,bool v) { (void)a;(void)p;(void)b;(void)n;(void)v;*sm=0;*o=0;return true; }
 static bool pio_claim_free_sm_and_add_program(const int *a,PIO *p,uint *sm,uint *o) { (void)a;(void)p;*sm=1;*o=0;return true; }
 static void pio_enable_sm_mask_in_sync(PIO p,uint32_t m) { (void)p;(void)m; }
-static void multicore_launch_core1(void (*fn)(void)) { (void)fn; fault("firmware startup reached core-1 launch"); }
-static void tight_loop_contents(void) {}
+static void multicore_launch_core1(void (*fn)(void)) { (void)fn; if(!startup_through_core0) fault("firmware startup reached core-1 launch"); }
+static void tight_loop_contents(void) { if(startup_through_core0) fault("core-0 foreground loop reached"); }
 #include "pianolaPinDriver.pio.h"
 #include "pianola24bitClock.pio.h"
 #endif

@@ -17,6 +17,7 @@ noticed when designing the PCB layout so there's some less than elegant code to 
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include <string.h>
 #include "pico/stdlib.h"
 #include "pico/time.h"
 #include "hardware/pio.h"
@@ -70,10 +71,13 @@ static const uint pianolaOutputPins[] = {
 queue_t responseQ;
 queue_t commandQ;
 queue_t dumpDebugQ;
-bool dumpDebugFlag=false;
 
 #define responseQWidth 32
 #define commandQWidth 32
+#define commandQDepth 32
+#define responseQDepth 32
+// Internal queue marker; never transmitted as a protocol response length.
+#define RESPONSE_DEBUG_DUMP 0xFF
 
 #define dumpDebugQWidth 32
 #define dumpDebugQDepth 32
@@ -173,7 +177,7 @@ enum CMD_SET
 };
 
 // ===============================================================================
-// Helper Functions That need to be decalred before the parsers
+// Helper Functions that need to be declared before the parsers
 //================================================================================
 
 void updateStatusLED(void)
@@ -422,7 +426,7 @@ void CommandParser(unsigned char *ptrDataReceived, unsigned char *ptrDataRespons
             break;
 
         case IRQ_DumpLog:
-            dumpDebugFlag = true;
+            bytesToRespond = RESPONSE_DEBUG_DUMP;
             break;
 
         default:
@@ -435,9 +439,9 @@ void CommandParser(unsigned char *ptrDataReceived, unsigned char *ptrDataRespons
     // add response to the debug buffer
     
     unsigned char debugEntry[32] ={0};
-    if (bytesToRespond > 0)
+    if (bytesToRespond > 0 && bytesToRespond < responseQWidth)
     {
-        for (int i = 0; i < bytesToRespond; i++)
+        for (int i = 0; i <= bytesToRespond; i++)
         {
             debugEntry[i] = ptrDataResponse[i];
         }
@@ -453,59 +457,71 @@ void CommandParser(unsigned char *ptrDataReceived, unsigned char *ptrDataRespons
 // ===============================================================================
 // Pianola Manager and UART handler
 //================================================================================
-void uartHandlerCore0(void)
+// Core 0 is the sole UART owner. No UART IRQ handler is installed. Each call
+// does bounded work so RX and TX continue independently, even for partial packets
+// or a busy transmitter. Queue backpressure retains complete packets/responses.
+static unsigned char uartRxPacket[commandQWidth];
+static uint uartRxUsed = 0, uartRxExpected = 0;
+static unsigned char uartTxBuffer[dumpDebugQWidth * dumpDebugQDepth];
+static uint uartTxUsed = 0, uartTxLength = 0;
+
+void core0Step(void)
 {
-    // is there data to read
-    if(uart_is_readable(UART_ID))
+    // Preserve wire order, including an entire debug dump before later replies.
+    if (uartTxUsed == uartTxLength)
     {
-        // get first char and parse to decide how many more bytes to read
-        uint8_t opcode = uart_getc(UART_ID);
-        unsigned char * inBufferCore0 = malloc(32 * sizeof(unsigned char));
-        uint8_t numBytes = BytesToReceive(opcode);
-        *(inBufferCore0) = opcode & 0xFF;
-        // get the rest of the characters
-        for (int i = 1; i < numBytes; i++)
+        unsigned char response[responseQWidth];
+        uartTxUsed = uartTxLength = 0;
+        if (queue_try_remove(&responseQ, response))
         {
-            *(inBufferCore0 + i) = uart_getc(UART_ID);
-        }
-        // add to the command queue
-        queue_try_add(&commandQ, inBufferCore0);
-        free(inBufferCore0);
-    }
-    if (!queue_is_empty(&responseQ))
-    {
-        // if theres a response waiting, then remove it from the qeueue and send it to the host.
-        unsigned char* outBufferCore0 = malloc(32*sizeof(unsigned char));
-        queue_try_remove(&responseQ, outBufferCore0);
-        int numBytesToWrite = *outBufferCore0;
-        uart_write_blocking(UART_ID, (outBufferCore0+1), numBytesToWrite);
-
-        free(outBufferCore0);
-    }
-    if (dumpDebugFlag)
-    {
-        // send out all 32 entries of 32 bytes back to the host. 
-        // since its a queue we'll just send 0s after we exhaust all the entries
-
-        int numEntries = queue_get_level(&dumpDebugQ);
-        int numBytesToWrite = 32;
-        unsigned char* outDebugCore0 = malloc(dumpDebugQWidth * dumpDebugQDepth * sizeof(unsigned char));
-        for (int i = 0; i < numEntries; i++)
-        {
-            queue_try_remove(&dumpDebugQ, outDebugCore0+(i* dumpDebugQDepth));
-        }
-        if (numEntries < dumpDebugQDepth)
-        {
-            //write zeroes to the remaining slots in the malloced buffer
-            for (int i = numEntries; i < dumpDebugQDepth; i++)
+            if (response[0] == RESPONSE_DEBUG_DUMP)
             {
-                outDebugCore0[i] = 0x00;
+                // Snapshot the available records and pad complete unused records.
+                // The request travelled through responseQ, not a shared flag.
+                memset(uartTxBuffer, 0, sizeof(uartTxBuffer));
+                uint records = queue_get_level(&dumpDebugQ);
+                for (uint i = 0; i < records; i++)
+                {
+                    if (!queue_try_remove(&dumpDebugQ, uartTxBuffer + i * dumpDebugQWidth))
+                        break;
+                }
+                uartTxLength = sizeof(uartTxBuffer);
+            }
+            else
+            {
+                assert(response[0] < responseQWidth);
+                uartTxLength = response[0];
+                memcpy(uartTxBuffer, response + 1, uartTxLength);
             }
         }
-        uart_write_blocking(UART_ID, outDebugCore0, 1024);
-        free(outDebugCore0);
-        dumpDebugFlag = false;      
     }
+    for (uint budget = 0; budget < 32 && uartTxUsed < uartTxLength; budget++)
+    {
+        if (!uart_is_writable(UART_ID)) break;
+        uart_putc_raw(UART_ID, uartTxBuffer[uartTxUsed++]);
+    }
+
+    for (uint budget = 0; budget < 32; budget++)
+    {
+        if (uartRxExpected && uartRxUsed == uartRxExpected)
+        {
+            if (!queue_try_add(&commandQ, uartRxPacket)) break;
+            uartRxUsed = uartRxExpected = 0;
+        }
+        if (!uart_is_readable(UART_ID)) break;
+        unsigned char byte = uart_getc(UART_ID);
+        if (!uartRxUsed)
+        {
+            memset(uartRxPacket, 0, sizeof(uartRxPacket));
+            uartRxExpected = BytesToReceive(byte);
+            assert(uartRxExpected > 0 && uartRxExpected <= sizeof(uartRxPacket));
+        }
+        uartRxPacket[uartRxUsed++] = byte;
+    }
+    // A packet completed on the last byte of this call's budget is ready now.
+    if (uartRxExpected && uartRxUsed == uartRxExpected &&
+        queue_try_add(&commandQ, uartRxPacket))
+        uartRxUsed = uartRxExpected = 0;
 }
 
 // One iteration is shared by the device loop and deterministic native tests.
@@ -526,31 +542,22 @@ void pianolaManagerStep(void)
         pianolaFireTime = 0;
     }
 
-    // if theres a command sitting waiting to be processed
-    if (!queue_is_empty(&commandQ))
+    // Never block playback on a full response queue or lose a pending reply.
+    // These buffers belong to core 1 only; queue operations provide publication.
+    static unsigned char pendingResponse[responseQWidth];
+    static bool responsePending = false;
+    if (responsePending && queue_try_add(&responseQ, pendingResponse))
+        responsePending = false;
+    if (!responsePending)
     {
-        // allocate buffers for data we've just received, and the response
-        unsigned char* inBufferCore1 = malloc(32*sizeof(unsigned char));
-        unsigned char* outBufferCore1 = malloc(32*sizeof(unsigned char));
-        bool removeFlagCore1 = queue_try_remove(&commandQ, inBufferCore1);
-
-        //process the command and form the response
-        CommandParser(inBufferCore1, outBufferCore1);
-
-        // if we have a response add it too the queue
-        bool addFlagCore1 = false;
-
-        if (*outBufferCore1 > 0)
+        unsigned char command[commandQWidth];
+        if (queue_try_remove(&commandQ, command))
         {
-            addFlagCore1 = queue_try_add(&responseQ, outBufferCore1);
+            memset(pendingResponse, 0, sizeof(pendingResponse));
+            CommandParser(command, pendingResponse);
+            if (pendingResponse[0] && !queue_try_add(&responseQ, pendingResponse))
+                responsePending = true;
         }
-
-        //free buffers
-        free(inBufferCore1);
-        free(outBufferCore1);
-
-        //hand over to UART interrupt handler
-        uartHandlerCore0();
     }
     //if theres an instruction to execute / we're currently running
     if ((pianolaStatus == RUNNING | pianolaStatus == REPEATING) && pio_sm_is_tx_fifo_empty(pioBlock, smPinDriver))
@@ -610,9 +617,8 @@ void stabilisePianolaClock(void)
 #endif
 void main(void)
 {
-    // This is Core0 which handles basic setup of hardware and then runs an interrupt 
-    // to handle reading incoming commands and sending out responses
-    // Core 1 handles the running of the pianola and some command handling as well.
+    // Core 0 owns UART RX/TX; core 1 owns commands and playback.
+    // Only queues cross the core boundary.
 
     stdio_init_all();
 
@@ -625,8 +631,8 @@ void main(void)
     // create queues to store commands we want to shuffle between cores
     // commandQ stores a single char array of 32 bytes containing data received over UART
     // responseQ stores a single 32byte char array which will contain the reponse to any command.
-    queue_init(&commandQ, commandQWidth*sizeof(unsigned char), 1);
-    queue_init(&responseQ, responseQWidth*sizeof(unsigned char), 1);
+    queue_init(&commandQ, commandQWidth*sizeof(unsigned char), commandQDepth);
+    queue_init(&responseQ, responseQWidth*sizeof(unsigned char), responseQDepth);
     queue_init(&dumpDebugQ, dumpDebugQWidth*sizeof(unsigned char), dumpDebugQDepth);
 
     // init the uart and gpios
@@ -636,9 +642,8 @@ void main(void)
     uart_set_hw_flow(UART_ID, false, false);
     uart_set_format(UART_ID, DATA_BITS, STOP_BITS, PARITY);
 
-    irq_set_exclusive_handler(UART_INTERRUPT, uartHandlerCore0);
-    irq_set_enabled(UART_INTERRUPT, true);
-    uart_set_irq_enables(UART_ID, true, false);
+    uart_set_irq_enables(UART_ID, false, false);
+    irq_set_enabled(UART_INTERRUPT, false);
 
     // claim state machines for the pio programs
     //pinDriver
@@ -659,12 +664,11 @@ void main(void)
     // launch the other core
     multicore_launch_core1(&pianolaManagerCore1);
 
-    // enter a tight loop while were not in a reset or panic mode
-    while(pianolaStatus < 6) // is pianolaStatus not RESET or PANIC
+    // Poll independently of received bytes, so an isolated query always gets
+    // its response serviced. No cross-core status polling or recursive restart.
+    while (true)
     {
+        core0Step();
         tight_loop_contents();
     }
-    // after we reset, everything else will be cleared to just auto reboot everything
-    main();
 }
-

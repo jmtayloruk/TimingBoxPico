@@ -113,3 +113,48 @@ reported separately. Existing bugs deliberately produce failures.
 
 See [tests/README.md](tests/README.md) for prerequisites, filters, exit codes,
 coverage, limitations and occasional hardware-validation guidance.
+
+For a connected Pico, `python3 tests/hardware_stress.py --list-ports` lists
+candidate serial ports. Omit `--port` to choose from the available USB-serial
+ports, or specify it explicitly for unattended stress checks; add `--interactive` for optional human onboard-LED observations. This
+replaces/runs the device's pianola. See the connected-device section in
+[tests/README.md](tests/README.md) for instructions and validation limits.
+
+## Development flashing over native USB
+
+The FTDI UART and Pico native USB are separate interfaces and can be connected
+at the same time. The modification/flashing notes already describe that setup.
+BOOTSEL is entered on a reset with the button held; it is not a permanent mode
+or a one-time provisioning step. Normal firmware starts again after flashing.
+If the FTDI connection still powers the board, unplugging only native USB does
+not necessarily reset it.
+
+Production builds keep native USB disabled by default. For software-assisted
+flashing, configure a development build (from this repository):
+
+```sh
+cmake -S . -B build/usb-flashing -DTIMINGBOX_USB_FLASHING=ON
+cmake --build build/usb-flashing
+```
+
+Once, enter BOOTSEL manually and load
+`build/usb-flashing/picoTimingBoxFirmware.uf2`. Thereafter leave both cables
+connected. Compatible running firmware exposes the SDK's USB reset interface;
+`picotool` can reboot it into BOOTSEL, verify/load a new image, and restart:
+
+```sh
+picotool load -f -v -x build/usb-flashing/picoTimingBoxFirmware.uf2
+```
+
+Use a device serial-number selector if multiple Picos are connected. Keep
+`TIMINGBOX_USB_FLASHING=ON` in subsequent builds to retain this convenience.
+The native USB CDC port is distinct from the `/dev/cu.usbserial*` FTDI port used
+by the application/stress tests. This option does not move the timing-box
+protocol to native USB or alter the UART baud rate.
+
+The option explicitly disables waiting for a USB host at startup and blocking
+USB stdout timeouts. USB still adds SDK background interrupt work (normally on
+core 0), so it is optional and its timing under load requires device validation.
+It is not a guaranteed recovery path for a completely wedged firmware; BOOTSEL
+with a physical reset/power cycle or an SWD debug probe remains the fallback.
+No watchdog has been added by this change.
