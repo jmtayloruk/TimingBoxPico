@@ -239,6 +239,16 @@ static void startPianola(void)
     pio_sm_set_enabled(pioBlock, smPinDriver, true);
 }
 
+// Forced PULL/OUT applies the whole pattern at once while the driver is halted.
+static void applyHaltedPinDriverMask(uint32_t pinMask)
+{
+    pio_sm_put(pioBlock, smPinDriver, pinMask);
+    pio_sm_exec_wait_blocking(pioBlock, smPinDriver, pio_encode_pull(false, true));
+    pio_sm_exec_wait_blocking(pioBlock, smPinDriver, pio_encode_out(pio_pins, 32));
+    pio_sm_exec_wait_blocking(pioBlock, smPinDriver,
+                             pio_encode_jmp(offsetPinDriver + pinDriver_wrap_target));
+}
+
 static void stopPianola(void)
 {
     cancelPinDriver();
@@ -247,14 +257,32 @@ static void stopPianola(void)
     pianolaRepeatFlag = 0;
     pianolaFirePending = false;
     // Intentional XMOS difference: rewind AND apply the currently programmed
-    // entry-zero pattern, ignoring its duration. Forced PULL/OUT works while
-    // halted and updates the entire OUT range atomically in one instruction.
-    pio_sm_put(pioBlock, smPinDriver, (uint32_t)(pianola[0] >> 32));
-    pio_sm_exec_wait_blocking(pioBlock, smPinDriver, pio_encode_pull(false, true));
-    pio_sm_exec_wait_blocking(pioBlock, smPinDriver, pio_encode_out(pio_pins, 32));
-    pio_sm_exec_wait_blocking(pioBlock, smPinDriver,
-                             pio_encode_jmp(offsetPinDriver + pinDriver_wrap_target));
-    // Remain disabled until the next start.
+    // entry-zero pattern, ignoring its duration.
+    applyHaltedPinDriverMask((uint32_t)(pianola[0] >> 32));
+}
+
+static void hardResetPianola(void)
+{
+    cancelPinDriver();
+    applyHaltedPinDriverMask(0);
+
+    pianolaPosition = 0;
+    pianolaFinalPosition = 0;
+    pianolaNumberOfEntries = 1;
+    pianolaRepeatAddr = 0;
+    pianolaRepeatFlag = 0;
+    pianolaFirePending = false;
+    pianolaFireTime = 0;
+    memset(pianola, 0, sizeof(pianola));
+
+    memset(pianolaCameraClock, 0, sizeof(pianolaCameraClock));
+    pivIdx = 0;
+    pivIntervalLaserPulses = 0;
+    pivDuratonPulsePair = 0;
+    pivIntervalPulseToExp = 0;
+    pivCameraExposure = 0;
+    pivCameraMonitorIdx = 0;
+    pianolaStatus = INIT;
 }
 
 int isTimeInFuture(uint32_t currentTime, uint32_t proposedTime)
@@ -452,12 +480,7 @@ void CommandParser(unsigned char *ptrDataReceived, unsigned char *ptrDataRespons
             break;
 
         case IRQ_HARDRESET:
-            stopPianola();
-            pianolaStatus = INIT;
-            pianolaFinalPosition = 0;
-            pianolaNumberOfEntries = 1;
-            pianolaRepeatAddr = 0;
-            pianolaPosition = 0;
+            hardResetPianola();
             break;
 
         case IRQ_DumpLog:

@@ -97,7 +97,9 @@ Call : CMD = 1 byte Response : how longs a piece of string?
 
 ### IRQ_HARDRESET => 0xFF
 
-Like the IRQ_StopAndReset command but the nuclear option. Clears any pending fires, the pianola instructions, and resets other flags / values to their defaults
+Cancels active and queued playback, drives all sequence outputs low, and clears
+the stored sequence, scheduled start, repeat settings, and camera-clock and PIV
+settings. Send one opcode byte. The command sends no reply.
 
 # To Do
 A short list of things that don't really interfere with the ability for the pianola to operate but are features present on other timing boxes that haven't been implemented.
@@ -172,9 +174,9 @@ its position but retains the previously applied pattern.
 Immediate run/restart discards old in-flight work, preloads entry zero and begins
 again without inserting an all-low pattern. Configured repetition survives a
 restart. Scheduled firing uses the same cancellation/start path at firing time.
-Hard reset also cancels the output pipeline through the stop path before resetting
-its existing software configuration. None of these operations restarts the
-independent clock SM or reboots the CPU.
+Hard reset clears the output pipeline and holds the outputs low until the next
+start. It runs in place, so the independent clock and UART continue serving
+commands.
 
 A transition emitted before the output SM is disabled cannot be undone. These
 semantics take effect when core 1 services the command; they do not promise zero

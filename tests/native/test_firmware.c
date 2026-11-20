@@ -207,10 +207,6 @@ static void test_restart(void) {
     CHECK(!(active && active_countdown==999 && fifo_level>=2 && fifo[1]==expected_mask(2)),"Restart left old active/queued work ahead of new entry zero");
     expect_next(1,1000,"Restart must begin at entry zero");
 }
-static void test_hardreset(void) {
-    SEND(4,1);SEND(3,99);SEND(6,0,4,0);SEND(0xFF);
-    CHECK(pianolaPosition==0 && pianolaFinalPosition==0 && pianolaRepeatAddr==0 && !pianolaRepeatFlag && !pianolaFirePending,"Hard reset retained repeat/pending configuration");
-}
 static void test_uart_owner(void) {
     SEND(0xFD);CHECK(!uart_context_errors,"Core 1 accessed UART %u times; UART must have one core owner",uart_context_errors);
 }
@@ -410,6 +406,62 @@ static void test_debug_wire_order(void) {
 static uint32_t output_levels(void) {
     return gpio_levels & ((1u<<2)|(1u<<11)|(1u<<14)|(1u<<15)|(1u<<25));
 }
+static void test_hardreset(void) {
+    entry(0,31,1000);
+    entry(1,2,4);
+    entry(255,4,42);
+    SEND(2,255);
+    SEND(3,1);
+    SEND(4,1);
+    SEND(11,7,0x12,0x34,0x56);
+    SEND(12,3,0,0,0,1,0,0,0,2,0,0,0,3,0,0,0,4,7);
+    fake_time=100;
+    run();
+    expect_next(31,1000,"Entry active before hard reset");
+    SEND(6,0,4,0);
+    CHECK(active && fifo_level==2 && output_levels()==(expected_mask(31)<<2) &&
+          pianolaFirePending && pianolaFireTime==1024,"Hard-reset test did not establish active, queued and scheduled work");
+
+    unsigned before=tx_count;
+    SEND(0xFF);
+    CHECK(tx_count==before,"Hard reset sent an unexpected reply");
+    CHECK(output_levels()==0,"Hard reset left outputs high");
+    CHECK(!active && !sm_enabled[0] && !fifo_level,"Hard reset retained active or queued output work");
+    CHECK(pianolaStatus==INIT && pianolaPosition==0 && pianolaFinalPosition==0 && pianolaNumberOfEntries==1,
+          "Hard reset did not restore initial playback state");
+    CHECK(!pianolaRepeatAddr && !pianolaRepeatFlag && !pianolaFirePending && !pianolaFireTime,
+          "Hard reset retained repeat or scheduled-start configuration");
+    for(unsigned i=0;i<count_of(pianola);i++)
+        CHECK(!pianola[i],"Hard reset retained entry %u",i);
+    for(unsigned i=0;i<count_of(pianolaCameraClock);i++)
+        CHECK(!pianolaCameraClock[i],"Hard reset retained camera clock %u",i);
+    CHECK(!pivIdx && !pivIntervalLaserPulses && !pivDuratonPulsePair &&
+          !pivIntervalPulseToExp && !pivCameraExposure && !pivCameraMonitorIdx,
+          "Hard reset retained PIV parameters");
+
+    unsigned submissions_after_reset=submitted_count;
+    fake_time=1025;
+    step();
+    CHECK(submitted_count==submissions_after_reset && !sm_enabled[0] && !output_levels(),
+          "Old scheduled start fired after hard reset");
+
+    const unsigned char startup[]={0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0x08};
+    receive_bytes(startup,sizeof(startup));
+    service();
+    for(unsigned i=0;i<sizeof(startup);i++) step();
+    service();
+    CHECK(tx_count==before+3 && tx[before]==0 && tx[before+1]==4 && tx[before+2]==1,
+          "Clock query after the reset burst did not return the current clock");
+    CHECK(!clock_control_changes && sm_enabled[1],"Hard reset modified the independent clock state machine");
+
+    run();
+    expect_next(0,0,"Run after hard reset uses the cleared entry zero");
+    active=false;
+    driver_pc=driver_wait_pc;
+    step();
+    CHECK(pianolaStatus==READY && !fifo_level && !output_levels(),
+          "Run after hard reset replayed or repeated old entries");
+}
 static void test_stop_freezes_entry_zero(void) {
     entry(0,17,0xFFFFFF);entry(1,2,1000);entry(2,4,1000);SEND(2,2);run();
     expect_next(17,0xFFFFFF,"Entry-zero start");step();expect_next(2,1000,"Different active pattern");step();
@@ -545,7 +597,7 @@ static const test tests[]={
  {"stop_pending","Control / stop cancels pending start",test_stop_pending},
  {"stop_queued","Control / stop cancels queued successor",test_stop_queued},
  {"restart_running","Control / restart discards old queued work",test_restart},
- {"hard_reset","Control / reset clears repeat and pending configuration",test_hardreset},
+ {"hard_reset","Control / hard reset clears playback and configuration",test_hardreset},
  {"uart_core_ownership","Concurrency / UART accessed only by core 0",test_uart_owner},
  {"upload_burst","Transport / serialized no-response command burst",test_queue_burst},
  {"fragmented_packet","Transport / partial packet must not block service",test_partial_packet},
