@@ -87,6 +87,55 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(target,(0xFFFFFE+hw.ticks(.01))&hw.MASK)
         self.assertEqual(peer.writes[-1],b'\x06'+hw.u24(target))
 
+    def test_generous_default_and_opt_in_short_lead(self):
+        args=hw.parser().parse_args([])
+        self.assertEqual(args.lead_ms,100)
+        self.assertIsNone(args.short_lead_ms)
+        self.assertEqual(hw.parser().parse_args(['--short-lead-ms','10']).short_lead_ms,10)
+
+    def probe_diagnostic(self,error=None,recovery_error=None):
+        events=[]
+        class Probe:
+            def upload(self,entries): events.append(('upload',entries))
+            def schedule(self,lead):
+                events.append(('schedule',lead))
+                if error: raise error
+            def stop(self): events.append(('stop',))
+            def clock(self):
+                events.append(('clock',))
+                if recovery_error: raise recovery_error
+        report=hw.Reporter()
+        with contextlib.redirect_stdout(io.StringIO()):hw.short_lead_diagnostic(Probe(),report,10)
+        return report,events
+
+    def test_short_lead_acceptance_is_timing_pass_and_cancelled(self):
+        report,events=self.probe_diagnostic()
+        self.assertEqual((report.results[0]['category'],report.results[0]['status']),('TIMING','PASS'))
+        self.assertEqual(events[-2:],[('stop',),('clock',)])
+
+    def test_expired_short_lead_is_warning_including_wrap_and_equality(self):
+        for target,now in ((1000,3400),(0xFFFFFE,100),(1000,1000)):
+            report,events=self.probe_diagnostic(hw.ScheduleRejected(target,now,10))
+            self.assertEqual((report.results[0]['category'],report.results[0]['status']),('TIMING','WARN'))
+            self.assertEqual(report.exit_code(),0)
+            report.strict=True;self.assertEqual(report.exit_code(),1)
+            self.assertEqual(events[-2:],[('stop',),('clock',)])
+
+    def test_future_target_rejection_remains_functional_failure(self):
+        report,_=self.probe_diagnostic(hw.ScheduleRejected(2000,1000,10))
+        self.assertEqual((report.results[0]['category'],report.results[0]['status']),('FUNCTIONAL','FAIL'))
+        self.assertIn('still future',report.results[0]['detail'])
+
+    def test_short_lead_transport_failures_are_not_downgraded(self):
+        for error in (hw.TransportFailure('missing bytes'),OSError('device disconnected')):
+            report,_=self.probe_diagnostic(error)
+            self.assertEqual((report.results[0]['category'],report.results[0]['status']),('FUNCTIONAL','FAIL'))
+            self.assertTrue(report.broken)
+
+    def test_recovery_failure_overrides_expired_target_warning(self):
+        report,_=self.probe_diagnostic(hw.ScheduleRejected(1000,2000,10),hw.TransportFailure('stop/query failed'))
+        self.assertEqual((report.results[0]['category'],report.results[0]['status']),('FUNCTIONAL','FAIL'))
+
     def test_no_response_commands_do_not_read_ack(self):
         peer=Peer();hw.Box(peer).stop()
         self.assertEqual(peer.writes,[b'\x07'])
@@ -136,6 +185,17 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(report['serial_trace'])
         self.assertTrue(all(r['status'] in ('PASS','WARN') for r in report['results']))
         self.assertIn('Explicit low',report['cleanup'])
+        self.assertNotIn('short_lead_schedule',[r['name'] for r in report['results']])
+
+    def test_main_runs_optional_diagnostic_and_records_category(self):
+        peer=Peer()
+        with tempfile.TemporaryDirectory() as d:
+            path=Path(d)/'report.json'
+            with patch.object(hw,'SerialPort',return_value=peer),patch.object(hw,'automated',return_value=16),patch.object(hw.time,'sleep'),contextlib.redirect_stdout(io.StringIO()):
+                code=hw.main(['--port','FAKE','--short-lead-ms','10','--json',str(path)])
+            result=json.loads(path.read_text())
+        self.assertEqual(code,0)
+        self.assertEqual([(r['name'],r['category'],r['status']) for r in result['results']],[('short_lead_schedule','TIMING','PASS')])
 
     def test_interactive_cases_are_separate_observations(self):
         box=hw.Box(Peer(),timeout=.01,quiet=0);report=hw.Reporter()

@@ -27,6 +27,12 @@ class Failure(Exception):
 class TransportFailure(Failure):
     """Stop testing: reply boundaries or connection health can no longer be trusted."""
 
+class ScheduleRejected(Failure):
+    """A well-formed rejection, with the device sample needed to classify it."""
+    def __init__(self, target, reported, lead_ms):
+        self.target, self.reported, self.lead_ms = target, reported, lead_ms
+        super().__init__(f'Scheduled start rejected: target=0x{target:06x}, reported now=0x{reported:06x}, lead={lead_ms:g} ms (USB/host delay can consume the lead)')
+
 class TimingWarning(Exception):
     pass
 
@@ -177,7 +183,7 @@ class Box:
             raise TransportFailure(f'Scheduled-start status is not boolean: {response.hex()}')
         if not response[0]:
             reported = int.from_bytes(response[1:], 'big')
-            raise Failure(f'Scheduled start rejected: target=0x{target:06x}, reported now=0x{reported:06x}, lead={lead_ms:g} ms (USB/host delay can consume the lead)')
+            raise ScheduleRejected(target, reported, lead_ms)
         return target
 
     def synchronise(self):
@@ -206,12 +212,12 @@ class Reporter:
     def __init__(self, strict=False):
         self.results, self.strict, self.broken = [], strict, False
 
-    def test(self, name, area, fn, human=False):
+    def test(self, name, area, fn, human=False, timing=False):
+        category = 'HUMAN' if human else 'TIMING' if timing else 'FUNCTIONAL'
         if self.broken:
-            self.results.append(dict(name=name, area=area, category='HUMAN' if human else 'FUNCTIONAL', status='SKIP', detail='Serial stream no longer trusted; power-cycle/reconnect before retrying'))
+            self.results.append(dict(name=name, area=area, category=category, status='SKIP', detail='Serial stream no longer trusted; power-cycle/reconnect before retrying'))
             print(f'SKIP  {name} — serial stream no longer trusted', flush=True)
             return
-        category = 'HUMAN' if human else 'FUNCTIONAL'
         try:
             fn()
             status, detail = 'PASS', ''
@@ -220,9 +226,11 @@ class Reporter:
         except TimingWarning as exc:
             category, status, detail = 'TIMING', 'WARN', str(exc)
         except OSError as exc:
+            if timing: category = 'FUNCTIONAL'
             status, detail = 'FAIL', f'Serial I/O error: {exc}'
             self.broken = True
         except Failure as exc:
+            if timing: category = 'FUNCTIONAL'
             status, detail = 'FAIL', str(exc)
             if isinstance(exc, TransportFailure):
                 self.broken = True
@@ -336,6 +344,31 @@ def automated(box, report, args):
         print(f'      Completed {iterations} seeded events over {args.seconds:g}s (seed={args.seed}).', flush=True)
     report.test('mixed_traffic', 'bounded serialized command load while playback is requested', stress)
     return led
+
+def short_lead_diagnostic(box, report, lead_ms):
+    """Acceptance timing only: expired-target rejection is a timing observation.
+
+    Transport corruption/timeouts and rejection of a still-future target remain
+    functional failures. No retry hides the outcome; stop cancels an accepted
+    request. There is no claim of measuring the actual output edge.
+    """
+    def check():
+        box.upload([(0, ticks(.01))])
+        expired = None
+        try:
+            box.schedule(lead_ms)
+        except ScheduleRejected as exc:
+            lateness = (exc.reported - exc.target) & MASK
+            if lateness >= 0x800000:
+                raise Failure(f'{exc}; target is still future according to the returned sample, so rejection is inconsistent') from None
+            expired = (exc, lateness)
+        box.stop()
+        box.clock()  # Recovery/service check must pass before reporting a warning.
+        if expired:
+            exc, lateness = expired
+            raise TimingWarning(f'{exc}; target expired by {lateness*TICK*1000:.3f} ms according to the device sample. This measures host/USB/firmware acceptance timing, not physical pin timing.')
+        print(f'      Accepted {lead_ms:g} ms lead in this exchange; request then cancelled. No output timing was measured.', flush=True)
+    report.test('short_lead_schedule', 'optional short-lead acceptance timing; no physical capture', check, timing=True)
 
 def ask(question):
     while True:
@@ -490,7 +523,8 @@ def parser():
     ap.add_argument('--list-ports', action='store_true', help='list candidate tty paths without opening a device')
     ap.add_argument('--seconds', type=float, default=10, help='mixed-traffic duration in seconds (default 10)')
     ap.add_argument('--timeout', type=float, default=.5, help='maximum seconds per transaction/write (default .5)')
-    ap.add_argument('--lead-ms', type=float, default=10, help='scheduled-start lead, ms (default 10; USB latency can matter)')
+    ap.add_argument('--lead-ms', type=float, default=100, help='communications-check scheduling lead, ms (default 100)')
+    ap.add_argument('--short-lead-ms', type=float, metavar='MS', help='opt-in short-lead timing diagnostic, e.g. 10; expired-target rejections are timing warnings')
     ap.add_argument('--seed', type=int, default=20261120, help='reproducible mixed-traffic seed')
     ap.add_argument('--led-bit', type=int, default=4, choices=range(8), help='logical sequence LED bit (default 4 = GP25 in current Pico firmware)')
     ap.add_argument('--interactive', action='store_true', help='add optional human LED observations')
@@ -506,6 +540,8 @@ def main(argv=None):
         return 0
     if not all(math.isfinite(x) for x in (args.seconds,args.timeout,args.lead_ms)) or not 0 < args.seconds <= 3600 or not .01 <= args.timeout <= 10 or not 1 <= args.lead_ms <= 1000:
         ap.error('Require 0 < seconds <= 3600, .01 <= timeout <= 10, and 1 <= lead-ms <= 1000')
+    if args.short_lead_ms is not None and (not math.isfinite(args.short_lead_ms) or not 1 <= args.short_lead_ms <= 1000):
+        ap.error('Require 1 <= short-lead-ms <= 1000')
     if args.interactive and args.led_bit != 4:
         ap.error('Interactive onboard-LED checks require --led-bit 4')
     if not args.port:
@@ -527,6 +563,8 @@ def main(argv=None):
         print('Disconnect attached equipment if mapping is uncertain. Automated results check serial service, not physical waveforms.', flush=True)
         port = SerialPort(args.port);box = Box(port,args.timeout)
         led = automated(box,report,args)
+        if args.short_lead_ms is not None:
+            short_lead_diagnostic(box,report,args.short_lead_ms)
         if args.interactive:
             human_tests(box,report,args,led)
     except KeyboardInterrupt:
