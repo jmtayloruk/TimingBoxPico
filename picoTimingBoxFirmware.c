@@ -82,12 +82,10 @@ queue_t dumpDebugQ;
 #define dumpDebugQWidth 32
 #define dumpDebugQDepth 32
 
-#define pianolaTimeBaseUS 2.56 // set to match the xmos board
 enum STATUS
 {
     INIT = 0,
     READY,
-    PENDING,
     RUNNING,
     REPEATING,
     STOPPED,
@@ -104,13 +102,10 @@ int pianolaPosition = 0;
 uint32_t pianolaNumberOfEntries = 1;
 uint32_t pianolaTime;
 
-// takes 4 cycles (approx. 4*2.56us) of the pio block to go from picking up the next instruction to actually 
-// driving pins - if we're within 10us just fire. This makes the future fire command a wee bit more accurate
-signed int delT;
-const uint32_t pianolaFireTimeThresholdUS = 10; 
-int pianolaFireTimeThresholdTicks = (int) (pianolaFireTimeThresholdUS / pianolaTimeBaseUS);
 uint8_t pianolaRepeatAddr = 0;
-volatile uint32_t pianolaFireTime = 0;
+// A scheduled restart can coexist with active playback.
+static bool pianolaFirePending;
+static uint32_t pianolaFireTime;
 
 // fixed at a 2.56us timebase to mimic the xmos
 // clock divisors represents as 24bit Fixed Point Ints - 16 Integral Bit, 8 Frac bits
@@ -180,15 +175,15 @@ enum CMD_SET
 
 void updateStatusLED(void)
 {
-    if (pianolaStatus == RUNNING)
-    {
-        gpio_put(STATUS_LED_GREEN, true);
-        gpio_put(STATUS_LED_BLUE, false);
-    }
-    else if (pianolaStatus == PENDING)
+    if (pianolaFirePending)
     {
         gpio_put(STATUS_LED_GREEN, false);
         gpio_put(STATUS_LED_BLUE, true);
+    }
+    else if (pianolaStatus == RUNNING)
+    {
+        gpio_put(STATUS_LED_GREEN, true);
+        gpio_put(STATUS_LED_BLUE, false);
     }
     else if (pianolaStatus == PANIC | pianolaStatus == RESET)
     {
@@ -235,7 +230,7 @@ static void queuePianolaEntry(uint8_t position)
 static void startPianola(void)
 {
     cancelPinDriver();
-    pianolaFireTime = 0;
+    pianolaFirePending = false;
     pianolaPosition = 1;
     pianolaStatus = RUNNING;
     // Preload one complete pair while halted. No old output pattern is applied
@@ -250,7 +245,7 @@ static void stopPianola(void)
     pianolaStatus = READY;
     pianolaPosition = 0;
     pianolaRepeatFlag = 0;
-    pianolaFireTime = 0;
+    pianolaFirePending = false;
     // Intentional XMOS difference: rewind AND apply the currently programmed
     // entry-zero pattern, ignoring its duration. Forced PULL/OUT works while
     // halted and updates the entire OUT range atomically in one instruction.
@@ -267,12 +262,6 @@ int isTimeInFuture(uint32_t currentTime, uint32_t proposedTime)
     // Compare modulo 2^24 using the XMOS half-range convention.
     uint32_t delta = (proposedTime - currentTime) & 0xFFFFFFu;
     return delta != 0 && delta < 0x800000u;
-}
-int shouldRunPianolaSoon(uint32_t currentTime, uint32_t proposedTime)
-{
-    // Include the target tick in the advance window, including across wraparound.
-    uint32_t delta = (proposedTime - currentTime) & 0xFFFFFFu;
-    return delta <= (uint32_t)pianolaFireTimeThresholdTicks;
 }
 
 // ===============================================================================
@@ -394,14 +383,12 @@ void CommandParser(unsigned char *ptrDataReceived, unsigned char *ptrDataRespons
             bytesToRespond = 4;
             uint32_t proposedFireTime = (ptrDataReceived[1] << 16) | (ptrDataReceived[2] << 8) | (ptrDataReceived[3]);
 
-            int validFireTime = isTimeInFuture(pianolaTime, proposedFireTime);
-            if (validFireTime)
-            {
-                pianolaFireTime = proposedFireTime;
-                pianolaStatus = PENDING;
-            }
+            pianolaTime = getPianolaTime();
+            // A rejected request also supersedes any previously armed start.
+            pianolaFirePending = isTimeInFuture(pianolaTime, proposedFireTime);
+            pianolaFireTime = proposedFireTime;
 
-            ptrDataResponse[1] =  validFireTime & 0xFF;
+            ptrDataResponse[1] = pianolaFirePending;
             ptrDataResponse[2] = (pianolaTime >> 16) & 0xFF;
             ptrDataResponse[3] = (pianolaTime >> 8) & 0xFF;
             ptrDataResponse[4] = pianolaTime & 0xFF;
@@ -577,10 +564,9 @@ void core0Step(void)
 void pianolaManagerStep(void)
 {
     updateStatusLED();
-    // if its time to change pianola state, we should do that now
     pianolaTime = getPianolaTime();
-    // if we're not running an pianola and we should be soon then we should get a move on
-    if ((pianolaStatus != RUNNING) && (pianolaStatus == PENDING) && (shouldRunPianolaSoon(pianolaTime, pianolaFireTime)))
+    // Fire on the target tick or on the next poll if the target was missed.
+    if (pianolaFirePending && !isTimeInFuture(pianolaTime, pianolaFireTime))
     {
         // Cancellation happens at firing, not when a future start is armed.
         startPianola();

@@ -80,7 +80,6 @@ static void test_time_arithmetic(void) {
         for(unsigned j=0;j<count_of(d);j++) {
             uint32_t target=(now+d[j])&0xFFFFFF;
             CHECK(isTimeInFuture(now,target)==(d[j]>0 && d[j]<0x800000),"24-bit future comparison failed: now=%06x target=%06x",now,target);
-            CHECK(shouldRunPianolaSoon(now,target)==(d[j]<=3),"Firing-window boundary failed at delta=%u",d[j]);
         }
     }
 }
@@ -89,9 +88,9 @@ static void test_reply_time(void) {
 }
 static void test_scheduled(void) {
     entry(0,1,4);SEND(2,0);fake_time=0xFFFF00;
-    SEND(6,0,3,0);CHECK(pianolaStatus==PENDING && tx[0]==1,"Scheduled start a few ms ahead across wrap must be accepted");
-    fake_time=0x2FC;step();CHECK(submitted_count==0,"Scheduled start executed before the advance window");
-    fake_time=0x2FD;step();expect_next(1,4,"Scheduled start across wrap");
+    SEND(6,0,3,0);CHECK(tx[0]==1,"Scheduled start a few ms ahead across wrap must be accepted");
+    fake_time=0x2FF;step();CHECK(submitted_count==0,"Scheduled start executed before its deadline");
+    fake_time=0x300;step();expect_next(1,4,"Scheduled start across wrap");
 }
 static void test_replace_pending(void) {
     entry(0,1,4);fake_time=100;step();SEND(6,0,4,0);SEND(6,0,8,0);
@@ -100,12 +99,20 @@ static void test_replace_pending(void) {
 }
 static void test_reject_cancels(void) {
     fake_time=100;step();SEND(6,0,4,0);SEND(6,0,0,99);
-    CHECK(pianolaStatus!=PENDING,"Rejected past start did not cancel the previously pending start (XMOS contract)");
+    CHECK(tx_count==8 && tx[0]==1 && tx[4]==0,"Expected acceptance followed by rejection");
+    fake_time=1024;step();
+    CHECK(!submitted_count,"Rejected past start did not cancel the previously pending start (XMOS contract)");
 }
 static void test_missed_deadline(void) {
-    entry(0,1,4);fake_time=100;step();SEND(6,0,4,0);
-    fake_time=1020;step();fake_time=1025;step();
-    CHECK(submitted_count>=2,"Polling skipped the firing window: accepted sequence remains pending after its deadline");
+    entry(0,1,4);fake_time=0xFFFF00;SEND(6,0,0,0);
+    CHECK(tx[0]==1,"Expected acceptance for a start scheduled at clock wrap");
+    fake_time=0xFFFFFC;step();
+    CHECK(!submitted_count,"Scheduled start executed before its deadline");
+    fake_time=1;step();
+    CHECK(submitted_count==2,"First poll after the deadline did not queue the start");
+    expect_next(1,4,"Scheduled start on the first poll after its deadline");
+    fake_time=2;step();
+    CHECK(submitted_count==2,"Late scheduled start fired more than once");
 }
 static void test_one_shot(void) {
     for(unsigned i=0;i<256;i++) entry(i,i,4+i);
@@ -161,8 +168,8 @@ static void test_scheduling_matrix(void) {
         entry(0,1,4);entry(1,2,8);SEND(2,1);fake_time=starts[i];step();
         unsigned target=(fake_time+1000)&0xFFFFFF;
         SEND(6,target>>16,target>>8,target);
-        for(unsigned delta=10;delta>3;delta--) {fake_time=(target-delta)&0xFFFFFF;step();CHECK(!submitted_count,"Start occurred too early in scheduling matrix");}
-        fake_time=(target-3)&0xFFFFFF;step();expect_next(1,4,"Matrix scheduled first entry");expect_next(2,8,"Matrix scheduled second entry");
+        for(unsigned delta=10;delta>0;delta--) {fake_time=(target-delta)&0xFFFFFF;step();CHECK(!submitted_count,"Start occurred too early in scheduling matrix");}
+        fake_time=target;step();expect_next(1,4,"Matrix scheduled first entry");expect_next(2,8,"Matrix scheduled second entry");
     }
 }
 static void test_repeat_off(void) {
@@ -186,7 +193,7 @@ static void test_invalid_repeat(void) {
     CHECK(pianolaStatus!=RUNNING && pianolaStatus!=REPEATING,"Repeat address beyond final entry leaves firmware stuck in active state");
 }
 static void test_stop_pending(void) {
-    fake_time=100;step();SEND(6,0,4,0);SEND(7);fake_time=1024;step();CHECK(fifo_level==0 && pianolaStatus!=PENDING,"Stop failed to cancel scheduled start");
+    fake_time=100;step();SEND(6,0,4,0);SEND(7);fake_time=1024;step();CHECK(fifo_level==0 && !pianolaFirePending,"Stop failed to cancel scheduled start");
 }
 static void prepare_active(void) {
     entry(0,1,1000);entry(1,2,4);SEND(2,1);run();expect_next(1,1000,"Active-entry setup");step();CHECK(fifo_level==2,"Test setup expected queued successor");
@@ -201,8 +208,8 @@ static void test_restart(void) {
     expect_next(1,1000,"Restart must begin at entry zero");
 }
 static void test_hardreset(void) {
-    SEND(4,1);SEND(3,99);SEND(0xFF);
-    CHECK(pianolaPosition==0 && pianolaFinalPosition==0 && pianolaRepeatAddr==0 && !pianolaRepeatFlag && !pianolaFireTime,"Hard reset retained repeat/pending configuration");
+    SEND(4,1);SEND(3,99);SEND(6,0,4,0);SEND(0xFF);
+    CHECK(pianolaPosition==0 && pianolaFinalPosition==0 && pianolaRepeatAddr==0 && !pianolaRepeatFlag && !pianolaFirePending,"Hard reset retained repeat/pending configuration");
 }
 static void test_uart_owner(void) {
     SEND(0xFD);CHECK(!uart_context_errors,"Core 1 accessed UART %u times; UART must have one core owner",uart_context_errors);
@@ -411,7 +418,7 @@ static void test_stop_freezes_entry_zero(void) {
     uint32_t expected=expected_mask(17)<<2;
     CHECK(output_levels()==expected,"Stop must apply nonzero entry-zero pattern, expected GPIO=0x%x got 0x%x",expected,gpio_levels);
     CHECK(!active && !sm_enabled[0] && !fifo_level,"Stop retained active/queued work or left output SM enabled");
-    CHECK(pianolaPosition==0 && pianolaStatus==READY && !pianolaFireTime && !pianolaRepeatFlag,"Stop did not rewind/cancel pending/repeat state");
+    CHECK(pianolaPosition==0 && pianolaStatus==READY && !pianolaFirePending && !pianolaRepeatFlag,"Stop did not rewind/cancel pending/repeat state");
     for(unsigned i=0;i<100;i++) {fake_time+=100;step();CHECK(!consume_entry(),"Stopped driver consumed a new entry");}
     CHECK(output_levels()==expected,"Stopped entry-zero pattern was not held indefinitely");
     CHECK(!clock_control_changes && sm_enabled[1],"Stop modified the independent clock state machine");
@@ -464,6 +471,15 @@ static void test_scheduled_restart_discards_old(void) {
     CHECK(!active && fifo_level==2 && fifo[0]==999 && fifo[1]==expected_mask(1),"Scheduled firing retained old active/queued work");
     expect_next(1,1000,"Scheduled restart entry zero");
 }
+static void test_rejected_restart_preserves_playback(void) {
+    entry(0,1,4);entry(1,2,8);entry(2,4,16);SEND(2,2);run();
+    expect_next(1,4,"Active sequence first entry");
+    fake_time=100;SEND(6,0,4,0);
+    expect_next(2,8,"Active sequence continues while restart is armed");
+    SEND(6,0,0,99);
+    fake_time=1024;step();
+    expect_next(4,16,"Active sequence continues after pending restart is rejected");
+}
 static void test_stop_then_start(void) {
     entry(0,16,4);entry(1,1,8);SEND(2,1);
     for(unsigned cycle=0;cycle<50;cycle++) {
@@ -514,13 +530,14 @@ static const test tests[]={
  {"scheduled_wrap_start","Scheduling / normal lead time across wrap",test_scheduled},
  {"replace_pending","Scheduling / replace an armed start",test_replace_pending},
  {"reject_cancels_pending","Scheduling / reject past request and cancel previous start",test_reject_cancels},
- {"missed_start_window","Scheduling / accepted start must not remain pending indefinitely",test_missed_deadline},
+ {"missed_deadline","Scheduling / fire on the first poll after the deadline across wrap",test_missed_deadline},
+ {"reject_preserves_playback","Scheduling / reject a restart while active playback continues",test_rejected_restart_preserves_playback},
  {"full_sequence","Playback / all 256 entries in order",test_one_shot},
  {"zero_duration","Playback / zero ticks encode as the minimum one tick",test_zero_duration},
  {"excluded_sentinel","Playback / honour final entry despite host sentinel",test_sentinel},
  {"repeat_boundary_matrix","Playback / short/full sequences and repeat-address boundaries",test_repeat_boundaries},
  {"undefined_opcodes","Protocol / undefined opcodes preserve following packet",test_unknown_commands},
- {"scheduled_start_matrix","Scheduling / start windows at signed and wrap boundaries",test_scheduling_matrix},
+ {"scheduled_start_matrix","Scheduling / exact deadlines at signed and wrap boundaries",test_scheduling_matrix},
  {"repeat_section","Playback / prefix then nonzero repeat section",test_repeat},
  {"single_entry_repeat","Playback / bounded sampling of an endless one-entry loop",test_single_repeat},
  {"disable_repeat","Playback / disabling an already active loop",test_repeat_off},
