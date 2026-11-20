@@ -48,16 +48,15 @@ For example:
 ```text
 FAIL [FUNCTIONAL] stop_queued — Control / stop cancels queued successor
      Stop left a successor in PIO FIFO; it can change outputs after stop
-WARN [TIMING] pio_four_tick_duration — Timing / four-tick assembly duration
-     4-tick boundary: expected 128 PIO cycles (10.24 us); ...
+WARN [TIMING] pio_entry_spacing — Timing / one- and four-tick entry spacing
+     Expected entry writes at [0, 32, 160] PIO cycles, ...
 ```
 
 Existing firmware bugs are deliberately ordinary failing tests, not expected
 failures which turn the suite green. Fixing them should turn their tests green.
-No firmware bug fixes are bundled with the harness. Intentional limitations,
-such as fixed output-source mappings and PIV-enable being a no-op, have explicit
-compatibility tests. If those features are implemented, update that documented
-contract and its tests together.
+Intentional limitations, such as fixed output-source mappings and PIV-enable
+being a no-op, have explicit compatibility tests. If those features are
+implemented, update that documented contract and its tests together.
 
 An inserted low between two high patterns and failure to retain the final pattern
 are functional failures: they change the output pattern. Extra elapsed time with
@@ -181,6 +180,9 @@ Occasional hardware checks should establish:
 1. Four-tick timing for isolated and consecutive short entries, including repeat
    boundaries, under idle and UART load. Check both edge spacing and pulse width.
 2. Continuous high across adjacent entries and final-state retention.
+   For a two-channel capture, repeat mask `0x01` for one tick and mask `0x03`
+   for four ticks. Bit 0 should stay high throughout and bit 1 should alternate
+   2.56 µs low and 10.24 µs high. Capture both idle and under UART load.
 3. Stop/restart with active and queued work, and scheduled-start latency/jitter.
 4. Clock freshness, wrap and absolute tick rate against an independent reference.
 5. If DMA is introduced, shortest loops, channel abort/restart and no stale work.
@@ -272,15 +274,15 @@ script returns 0. Running the existing firmware may expose the known UART bugs.
 
 ### Optional human LED observations
 
-`--interactive` adds four separately labelled HUMAN checks, with y/n/skip answers:
+`--interactive` adds five separately labelled HUMAN checks, with y/n/skip answers:
 
 Before **each** check, the script stops previous activity, executes an explicit
 low pattern, prints the complete instructions, and waits for Return. The LED
 should be OFF while you read. Enter `n` if the starting state is wrong or `s` to
 skip without starting. Once you press Return, watch only the LED: there are no
-mid-window questions or new instructions. After viewing, the script stops repeating playback
-and asks retrospective questions. The one-shot restart check is left finished:
-StopAndReset would relight its ON entry zero and create a misleading late flash.
+mid-window questions or new instructions. After viewing, the script stops
+repeating playback and asks retrospective questions. One-shot checks leave the
+final level visible through the question.
 
 1. A burst-uploaded, scheduled 1 Hz pattern, ON for roughly 25% of each cycle.
    After Return there is about half a second OFF, then five seconds of flashing.
@@ -298,6 +300,8 @@ StopAndReset would relight its ON entry zero and create a misleading late flash.
    for the rest of the eleven-second viewing window. An early OFF near four
    seconds, a gap or relighting is a failure. This deliberately replaces the
    ambiguous repeating two-seconds-ON/two-seconds-OFF check.
+5. A one-shot with one second OFF followed by a one-tick ON entry. The LED
+   should remain ON for the rest of the observation and through the question.
 
 Watch the **onboard LED**, not the green/blue state indicator. Interactive checks
 require the current bit-4 onboard mapping. They take roughly forty seconds plus

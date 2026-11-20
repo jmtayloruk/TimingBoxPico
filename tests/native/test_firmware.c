@@ -38,9 +38,10 @@ static uint32_t expected_mask(unsigned bits) {
 static void expect_next(unsigned bits,uint32_t duration,const char *where) {
     for(unsigned i=0;i<8 && fifo_level<2;i++) step();
     CHECK(consume_entry(),"%s: no complete next entry (FIFO has %u words)",where,fifo_level);
-    CHECK(active_duration==duration && active_mask==expected_mask(bits),
-        "%s: expected (duration=%u, mask=0x%08x), got (%u, 0x%08x)",
-        where,duration,expected_mask(bits),active_duration,active_mask);
+    uint32_t countdown = (duration > 1 ? duration : 1) - 1;
+    CHECK(active_countdown==countdown && active_mask==expected_mask(bits),
+        "%s: expected (countdown=%u, mask=0x%08x), got (%u, 0x%08x)",
+        where,countdown,expected_mask(bits),active_countdown,active_mask);
 }
 static void run(void) { SEND(5); }
 static void test_protocol_lengths(void) {
@@ -112,6 +113,12 @@ static void test_one_shot(void) {
     for(unsigned i=0;i<256;i++) expect_next(i,4+i,"256-entry one-shot");
     for(unsigned i=0;i<8;i++) step();CHECK(fifo_level==0 && submitted_count==512,"One-shot overran final address or duplicated entries");
 }
+static void test_zero_duration(void) {
+    entry(0,1,0);entry(1,3,0);entry(2,2,0xFFFFFF);SEND(2,2);run();
+    expect_next(1,0,"Zero-duration first entry");
+    expect_next(3,0,"Zero-duration refill");
+    expect_next(2,0xFFFFFF,"Maximum-duration refill");
+}
 static void test_sentinel(void) {
     entry(0,1,4);entry(1,2,781);SEND(2,1);entry(2,31,1);run();
     expect_next(1,4,"Sentinel test entry 0");expect_next(2,781,"Sentinel test entry 1");
@@ -182,7 +189,7 @@ static void test_stop_queued(void) {
 }
 static void test_restart(void) {
     prepare_active();run();
-    CHECK(!(active && active_duration==1000 && fifo_level>=2 && fifo[1]==expected_mask(2)),"Restart left old active/queued work ahead of new entry zero");
+    CHECK(!(active && active_countdown==999 && fifo_level>=2 && fifo[1]==expected_mask(2)),"Restart left old active/queued work ahead of new entry zero");
     expect_next(1,1000,"Restart must begin at entry zero");
 }
 static void test_hardreset(void) {
@@ -428,7 +435,7 @@ static void test_restart_inflight_matrix(void) {
         unsigned before=control_count;run();
         CHECK(!active && !driver_delay && !driver_shift_count,"Restart resumed old in-flight state at PC=%u FIFO=%u",pc,words);
         CHECK(driver_pc==offsetPinDriver+pinDriver_wrap_target && sm_enabled[0],"Restart did not enable at the wait-loop entry");
-        CHECK(fifo_level==2 && fifo[0]==1000 && fifo[1]==expected_mask(1),"Restart retained old FIFO words");
+        CHECK(fifo_level==2 && fifo[0]==999 && fifo[1]==expected_mask(1),"Restart retained old FIFO words");
         CHECK(output_levels()==(expected_mask(1)<<2),"Restart inserted an output change before entry-zero OUT");
         CHECK(controls[before].op=='E' && !controls[before].value && controls[before+1].op=='C' && controls[before+2].op=='R',"Restart cancellation ordering incorrect");
         CHECK(controls[before+4].op=='P' && controls[before+5].op=='P' && controls[before+6].op=='E' && controls[before+6].value,"Restart must preload a whole pair before enabling");
@@ -446,7 +453,7 @@ static void test_scheduled_restart_discards_old(void) {
     prepare_active();fake_time=100;step();SEND(6,0,4,0);
     CHECK(active && fifo_level==2,"Scheduling cancelled existing in-flight work before deadline");
     fake_time=1024;step();
-    CHECK(!active && fifo_level==2 && fifo[0]==1000 && fifo[1]==expected_mask(1),"Scheduled firing retained old active/queued work");
+    CHECK(!active && fifo_level==2 && fifo[0]==999 && fifo[1]==expected_mask(1),"Scheduled firing retained old active/queued work");
     expect_next(1,1000,"Scheduled restart entry zero");
 }
 static void test_stop_then_start(void) {
@@ -501,6 +508,7 @@ static const test tests[]={
  {"reject_cancels_pending","Scheduling / reject past request and cancel previous start",test_reject_cancels},
  {"missed_start_window","Scheduling / accepted start must not remain pending indefinitely",test_missed_deadline},
  {"full_sequence","Playback / all 256 entries in order",test_one_shot},
+ {"zero_duration","Playback / zero ticks encode as the minimum one tick",test_zero_duration},
  {"excluded_sentinel","Playback / honour final entry despite host sentinel",test_sentinel},
  {"repeat_boundary_matrix","Playback / short/full sequences and repeat-address boundaries",test_repeat_boundaries},
  {"undefined_opcodes","Protocol / undefined opcodes preserve following packet",test_unknown_commands},
@@ -528,9 +536,18 @@ int main(int argc,char **argv) {
     if(argc==2 && !strcmp(argv[1],"--list")) {for(unsigned i=0;i<count_of(tests);i++) printf("%s\t%s\n",tests[i].name,tests[i].area);return 0;}
     if(argc!=2) {fprintf(stderr,"Pass a test name or --list\n");return 2;}
     setup();
-    if(!strcmp(argv[1],"--trace")) {
-        entry(0,1,4); entry(1,1,4); SEND(2,1); run();
-        expect_next(1,4,"Trace first entry");expect_next(1,4,"Trace second entry");
+    bool repeat_trace = !strcmp(argv[1],"--repeat-trace");
+    if(repeat_trace || !strcmp(argv[1],"--trace")) {
+        entry(0,1,1); entry(1,3,4); entry(2,2,0); SEND(2,2);
+        if(repeat_trace) { SEND(3,1); SEND(4,1); }
+        run();
+        expect_next(1,1,"Trace first entry");
+        expect_next(3,4,"Trace second entry");
+        expect_next(2,0,"Trace final entry");
+        if(repeat_trace) {
+            expect_next(3,4,"Trace repeat from entry one");
+            expect_next(2,0,"Trace repeated final entry");
+        }
         printf("{\"words\":[");
         for(unsigned i=0;i<submitted_count;i++) printf("%s%u",i?",":"",submitted[i]);
         printf("]}\n");return 0;

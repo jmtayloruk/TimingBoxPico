@@ -70,28 +70,54 @@ def generate_headers(build, pianolas):
     (build / 'fixtures.h').write_text('\n'.join(header))
 
 def pio_tests(binary):
-    def driver():
-        words = json.loads(subprocess.check_output([str(binary), '--trace'], text=True))['words']
+    def driver(repeat=False):
+        trace = '--repeat-trace' if repeat else '--trace'
+        try:
+            result = subprocess.run([str(binary), trace], text=True, capture_output=True, timeout=5)
+        except subprocess.TimeoutExpired:
+            raise AssertionError('Firmware FIFO trace exceeded the five-second watchdog') from None
+        assert result.returncode == 0, result.stderr.strip() or f'Trace exited with status {result.returncode}'
+        words = json.loads(result.stdout)['words']
+        masks = [1, 0x201, 0x200]
+        if repeat:
+            masks.extend([0x201, 0x200])
+        assert len(words) == 2 * len(masks), 'Expected one firmware-generated FIFO pair per entry'
+
         p = Pio(ROOT / 'pianolaPinDriver.pio')
-        # Model a real four-word FIFO, initially full. This test deliberately
-        # removes CPU starvation so it isolates the assembly's own behaviour.
-        assert len(words) == 4, 'Expected two actual firmware-generated entries'
-        p.tx.extend(words)
-        return p
+        # Start with the first pair and refill as soon as the FIFO empties to
+        # isolate instruction timing from the CPU's real servicing latency.
+        for i in range(0, len(words), 2):
+            p.until(lambda: not p.tx)
+            p.tx.extend(words[i:i + 2])
+        p.until(lambda: not p.tx and p.pins == masks[-1])
+        return p, masks
+
     def no_glitch():
-        p = driver(); p.until(lambda: not p.tx and len(p.writes) >= 3)
-        # Adjacent entries both assert the same output: no low is permissible
-        # between their OUT instructions, regardless of final-state policy.
-        values = [v for _, v in p.writes]
-        assert values[:3] != [1, 0, 1], 'PIO clears output between adjacent high entries; continuous high was required'
+        for repeat in (False, True):
+            p, masks = driver(repeat)
+            actual = [mask for _, mask in p.writes]
+            assert actual == masks, f'Expected direct mask transitions {masks}, got {actual}'
+
     def final_hold():
-        p = driver(); p.until(lambda: not p.tx and len(p.writes) >= 2)
-        for _ in range(1000): p.step()
-        assert p.pins == 1, f'Final output should remain high; actual modelled pattern is 0x{p.pins:x}'
-    def four_tick_width():
-        p = driver(); p.until(lambda: len(p.writes) >= 2)
-        elapsed = p.writes[1][0] - p.writes[0][0]
-        assert elapsed == 128, f'4-tick boundary: expected 128 PIO cycles (10.24 us); first following write is at {elapsed} cycles ({elapsed * .08:.2f} us)'
+        p, masks = driver()
+        for _ in range(1000):
+            p.step()
+        assert [mask for _, mask in p.writes] == masks
+        assert p.pins == masks[-1], f'Final mask changed to 0x{p.pins:x}'
+
+    def entry_spacing(repeat=False):
+        p, _ = driver(repeat)
+        cycles = [cycle - p.writes[0][0] for cycle, _ in p.writes]
+        expected = [0, 32, 160, 192, 320] if repeat else [0, 32, 160]
+        assert cycles == expected, f'Expected entry writes at {expected} PIO cycles, got {cycles}'
+
+    def final_duration():
+        p, _ = driver()
+        p.until(lambda: p.pc == p.wrap_target)
+        elapsed = p.cycles - p.writes[-1][0]
+        assert 32 <= elapsed <= 34, (
+            f'Expected idle immediately after the minimum one-tick entry, got {elapsed} PIO cycles'
+        )
     def clock_freshness():
         p = Pio(ROOT / 'pianola24bitClock.pio'); p.tx.append(15)
         p.until(lambda: len(p.rx) == 4)
@@ -115,7 +141,9 @@ def pio_tests(binary):
         ('functional', 'pio_adjacent_patterns', 'PIO / no inserted low between high entries', no_glitch),
         ('functional', 'pio_final_pattern', 'PIO / retain final output pattern', final_hold),
         ('functional', 'clock_sample_freshness', 'Clock PIO / fresh sample per request', clock_freshness),
-        ('timing', 'pio_four_tick_duration', 'Timing / four-tick assembly duration', four_tick_width),
+        ('timing', 'pio_entry_spacing', 'Timing / one- and four-tick entry spacing', entry_spacing),
+        ('timing', 'pio_repeat_spacing', 'Timing / entry spacing through the repeat boundary', lambda: entry_spacing(repeat=True)),
+        ('timing', 'pio_final_duration', 'Timing / minimum-duration final entry reaches idle after one tick', final_duration),
         ('timing', 'clock_divider_agreement', 'Timing / clock/output tick agreement', divider),
     ]
 

@@ -1,31 +1,36 @@
 ; A single state machine drives the four BNCs and the onboard LED.
-; Their GPIOs are nonconsecutive, so each entry uses a duration word and a GPIO mask word.
-; To reduce the latency between triggers appearing in the fifos and the actual issuing of triggers only the instruction
-; within the loopForTriggerDuration label actually run at a 2.56us tick rate. The effective 384X clock divider required 
-; is comprised of a 12X global clock divider (80ns tick rate) that is slowed by a further factor of 32 (2.56us tick rate)
-; by adding a 31 tick delay to a 1 tick jmp instruction = 32 ticks.
-; The wait loop takes 320ns to catch a trigger as a worst case. There's then 240ns before the pins go high. Giving the total off set as 
-; 570ns or approx 0.2 ticks
+; Their GPIOs are nonconsecutive, so each FIFO entry has a zero-based duration
+; word followed by a GPIO mask word.
+; The 12X system clock divider gives an 80 ns PIO cycle at 150 MHz.
+; One Pianola tick is 32 PIO cycles (2.56 us). The last tick includes the
+; instructions that check for and load the next entry. Only OUT changes the
+; pins, so the current pattern stays latched while the state machine waits.
 
 .program pinDriver
-.mov_status txfifo < 2                  ; "STATUS" Flag goes from 1 to 0 when the tx FIFO has 2 entries
+.mov_status txfifo < 2                  ; STATUS is all ones below two TX words and zero otherwise.
 .wrap_target
 waitForTrigger:
-    mov y, status                       ; "STATUS" Flag is moved to y register.            
-    jmp !y issueTrigger                 ; If y is zero then theres a pinmask and duration waiting - start issuing a trigger
-    jmp waitForTrigger                  ; Otherwise jump back to waitForTrigger and continue waiting for a trigger
+    mov y, status                       ; Copy the FIFO status to Y so the branch can test it.
+    jmp !y issueTrigger                 ; Y is zero once both the duration and the mask are available.
+    jmp waitForTrigger                  ; Poll again when there is no complete entry yet.
 
-; Theres always going to be 2 words in the tx FIFO by the time we get here so non-blocking pulls are fine
+durationTick:
+    jmp countdown [5]                   ; Jump back to test X. These 6 cycles plus the taken countdown's 26 make one tick.
+
+; The FIFO check guarantees that both blocking pulls can proceed.
 issueTrigger:
-    pull                                ; Pull in word containing the trigger duration
-    mov x, osr                          ; Move from OSR into X scratch register where we can perform operations
-    pull                                ; Pull in word containing the pin mask
-    out pins, 32                        ; Push pin mask to the outputs
-loopForTriggerDuration:
-    jmp x-- loopForTriggerDuration [31] ; Decrement counter by one (1 cycle), and delay for an extra 31 cycles (2.56us)
-resetPins:
-    mov pins, null                      ; Clear the entire OUT range in one cycle.
-    jmp waitForTrigger
+    pull                                ; Pull the duration word from the TX FIFO into the output shift register.
+    mov x, osr                          ; Copy the zero-based countdown into scratch register X.
+    pull                                ; Pull the GPIO mask into the output shift register.
+    out pins, 32                        ; Apply the whole new mask in one write.
+countdown:
+    jmp x-- durationTick [25]            ; Test X before decrementing it. A nonzero value branches for another full tick.
+    ; Last tick: OUT (1) + countdown (26) + FIFO check (2) + load (3).
+    mov y, status                       ; X reached zero. Check whether the next pair is already queued.
+    jmp !y issueTrigger                 ; If ready, spend the last three cycles loading it before the next OUT.
+    nop [2]                             ; With no successor, spend those three cycles holding the current mask.
+    jmp waitForTrigger                  ; Return to the idle PC the firmware checks for completion.
+.wrap
 
 
 ;; write the sdk
@@ -36,7 +41,7 @@ static inline void pinDriver_program_init(PIO pioBlock, uint stateMachine, uint 
         // configure the state machine using a bog standard configuration
         pio_sm_config config = pinDriver_program_get_default_config(stateMachineOffset);
 
-        // OUT and MOV share the same output range.
+        // Map OUT to the GPIO span that contains the sequence outputs.
         sm_config_set_out_pins(&config, firstPin, pinSpan);
 
         // set clock divider

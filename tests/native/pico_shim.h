@@ -39,7 +39,7 @@ static void control(char op,uint sm,uint32_t value) {
     controls[control_count].op=op;controls[control_count].sm=sm;controls[control_count++].value=value;
     if(sm==1) clock_control_changes++;
 }
-static uint32_t active_duration, active_mask;
+static uint32_t active_countdown, active_mask;
 static unsigned clock_requests;
 static unsigned irq_handler_registrations, uart_irq_enabled, cpu_uart_irq_enabled;
 static bool startup_through_core0;
@@ -132,7 +132,7 @@ static void pio_sm_exec_wait_blocking(PIO p,unsigned sm,uint instruction) {
 static bool consume_entry(void) {
     if(!sm_enabled[0] || fifo_level<2) return false;
     if(driver_delay) fault("Old instruction delay resumed instead of a clean start");
-    active=true; active_duration=fifo[0]; active_mask=fifo[1];driver_pc=driver_wait_pc+7;
+    active=true; active_countdown=fifo[0]; active_mask=fifo[1];driver_pc=driver_wait_pc+7;
     uint32_t mask=(output_count==32?UINT32_MAX:((1u<<output_count)-1))<<output_base;
     gpio_levels=(gpio_levels&~mask)|((active_mask<<output_base)&mask);
     memmove(fifo,fifo+2,(fifo_level-2)*sizeof(*fifo)); fifo_level-=2; return true;

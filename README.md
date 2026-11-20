@@ -178,6 +178,10 @@ independent clock SM or reboots the CPU.
 
 A transition emitted before the output SM is disabled cannot be undone. These
 semantics take effect when core 1 services the command; they do not promise zero
-UART/command latency. Other known PIO timing/automatic-clear issues remain: this
-change does not alter ordinary entry durations, between-entry clearing or final
-pattern retention at natural completion. See the native and connected test docs.
+UART/command latency.
+
+During playback, the output state machine applies each entry's mask in one
+write and holds the final mask at natural completion. Adjacent updates are
+2.56 µs apart per requested tick when the next entry is queued in time. A zero
+duration uses the minimum of one tick. If a successor arrives late, the current
+mask stays asserted until the next complete pair is available.

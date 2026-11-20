@@ -454,6 +454,17 @@ def human_tests(box, report, args, led):
         ask('Was the LED continuously ON for about 7 seconds, then OFF for the rest, without gaps or relighting?')
     report.test('led_restart', 'one-shot restart extends a continuous ON interval', restart, human=True)
 
+    def final_hold():
+        prepare_dark()
+        box.upload([(0, ticks(1)), (led, 1)], repeat=False)
+        ready_to_watch('FINAL HOLD CHECK: After Return, watch for 4 seconds. The LED should\n'
+                       'stay OFF for about one second, then turn ON and stay ON until you answer.')
+        box.run()
+        time.sleep(4)
+        observation_finished(stop_playback=False)
+        ask('Did the LED turn ON after about one second and stay ON for the rest of the observation?')
+    report.test('led_final_hold', 'one-shot playback holds the final ON pattern', final_hold, human=True)
+
 def choose_port():
     """Offer only macOS USB-serial callout ports; never open one implicitly."""
     ports = sorted(set(glob.glob('/dev/cu.usbserial*')))

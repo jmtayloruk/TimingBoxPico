@@ -142,8 +142,8 @@ class RunnerTests(unittest.TestCase):
         args=hw.parser().parse_args(['--port','FAKE'])
         with patch.object(hw.time,'sleep'),patch('builtins.input',side_effect=lambda text: '' if text.startswith('Press Return') else 'y') as prompt,contextlib.redirect_stdout(io.StringIO()):
             hw.human_tests(box,report,args,16)
-        self.assertEqual(prompt.call_count,9)
-        self.assertEqual(len(report.results),4)
+        self.assertEqual(prompt.call_count,11)
+        self.assertEqual(len(report.results),5)
         self.assertTrue(all(r['category']=='HUMAN' and r['status']=='PASS' for r in report.results))
 
     def test_human_actions_wait_for_readiness_and_restart_is_one_shot(self):
@@ -162,7 +162,7 @@ class RunnerTests(unittest.TestCase):
         with patch.object(hw.time,'sleep',side_effect=lambda n:events.append(('sleep',n))),patch('builtins.input',side_effect=input_for),contextlib.redirect_stdout(io.StringIO()):
             hw.human_tests(RecordingBox(),report,args,16)
         starts=[i for i,e in enumerate(events) if e[0]=='ready']
-        self.assertEqual(len(starts),4)
+        self.assertEqual(len(starts),5)
         for start,end in zip([0]+starts[:-1],starts):
             # Each section prepares darkness before offering readiness.
             self.assertIn(('dark',),events[start:end])
@@ -177,14 +177,19 @@ class RunnerTests(unittest.TestCase):
         self.assertIn(('schedule',2000),replacement[:first_answer])
         self.assertIn(('schedule',6000),replacement[:first_answer])
         self.assertIn(('sleep',10),replacement[:first_answer])
-        restart_upload=[e for e in events if e[0]=='upload'][-1]
+        restart_upload=[e for e in events if e[0]=='upload'][-2]
         self.assertFalse(restart_upload[2]['repeat'])
         self.assertEqual(restart_upload[1],[(16,hw.ticks(4)),(0,hw.ticks(2))])
         restart=events[starts[3]:]
+        restart=restart[:restart.index(('answer',))+1]
         self.assertEqual([e for e in restart if e[0]=='run'],[('run',),('run',)])
         self.assertIn(('sleep',3),restart)
         self.assertIn(('sleep',8),restart)
         self.assertNotIn(('stop',),restart,'Stopping after the viewing window would relight ON entry zero')
+        final_upload=[e for e in events if e[0]=='upload'][-1]
+        self.assertFalse(final_upload[2]['repeat'])
+        self.assertEqual(final_upload[1],[(0,hw.ticks(1)),(16,1)])
+        self.assertEqual(events[starts[4]+1:],[('run',),('sleep',4),('answer',)])
 
     def test_readiness_skip_wrong_start_and_eof(self):
         for answer,exception in [('s',hw.ObservationSkipped),('n',hw.Failure)]:

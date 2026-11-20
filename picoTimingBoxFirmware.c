@@ -117,9 +117,7 @@ volatile uint32_t pianolaFireTime = 0;
 // If they need to change is relatively straightorward to do this by hand - coding its a bit of a faff
 uint32_t pianolaClockDivisorFP = 0x02666; // 38.4X clockdivider (38.3984375 due to rounding.)
 uint32_t pinDriverClockDivisorFP = 0x000C00; // 12X clockdivider
-// 12X divider since we also delay each trigger duration by 32 ticks => 384X effective divider giving us the 2.56us tick length.
-// trigger durations are zero indexed so remove one tick from each requested trigger.
-const int pianolaPinTriggerOffset = 1;
+// 32 PIO cycles per Pianola tick give a 384X effective divider.
 
 enum STATUS pianolaStatus = INIT;
 
@@ -224,6 +222,18 @@ static void cancelPinDriver(void)
                              pio_encode_jmp(offsetPinDriver + pinDriver_wrap_target));
 }
 
+static void queuePianolaEntry(uint8_t position)
+{
+    uint64_t entry = pianola[position];
+    uint32_t duration = (uint32_t)entry;
+    // The PIO's zero-count path already takes one tick, including the mask
+    // write and the transition to the next entry. Each taken countdown branch
+    // adds one tick, so four requested ticks are encoded as three.
+    // Encode zero as zero to retain the one-tick minimum without underflow.
+    pio_sm_put(pioBlock, smPinDriver, duration ? duration - 1 : 0);
+    pio_sm_put(pioBlock, smPinDriver, (uint32_t)(entry >> 32));
+}
+
 static void startPianola(void)
 {
     cancelPinDriver();
@@ -232,9 +242,7 @@ static void startPianola(void)
     pianolaStatus = RUNNING;
     // Preload one complete pair while halted. No old output pattern is applied
     // or cleared between cancellation and the new entry-zero OUT instruction.
-    uint64_t first = pianola[0];
-    pio_sm_put(pioBlock, smPinDriver, (uint32_t)first);
-    pio_sm_put(pioBlock, smPinDriver, (uint32_t)(first >> 32));
+    queuePianolaEntry(0);
     pio_sm_set_enabled(pioBlock, smPinDriver, true);
 }
 
@@ -253,7 +261,7 @@ static void stopPianola(void)
     pio_sm_exec_wait_blocking(pioBlock, smPinDriver, pio_encode_out(pio_pins, 32));
     pio_sm_exec_wait_blocking(pioBlock, smPinDriver,
                              pio_encode_jmp(offsetPinDriver + pinDriver_wrap_target));
-    // Remain disabled: even the driver's automatic pin-clear cannot run.
+    // Remain disabled until the next start.
 }
 
 int isTimeInFuture(uint32_t currentTime, uint32_t proposedTime)
@@ -602,10 +610,7 @@ void pianolaManagerStep(void)
     {
         if (pianolaPosition <= pianolaFinalPosition)
         {
-            uint32_t duration = pianola[pianolaPosition] & 0xFFFFFFFF;
-            uint32_t pinMask = pianola[pianolaPosition] >> 32;
-            pio_sm_put(pioBlock, smPinDriver, duration);
-            pio_sm_put(pioBlock, smPinDriver, pinMask);
+            queuePianolaEntry(pianolaPosition);
             pianolaPosition++;
         }
         // if we get to the end of the pianola
