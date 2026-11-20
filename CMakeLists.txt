@@ -45,6 +45,8 @@ pico_generate_pio_header(picoTimingBoxFirmware ${CMAKE_CURRENT_LIST_DIR}/pianola
 pico_generate_pio_header(picoTimingBoxFirmware ${CMAKE_CURRENT_LIST_DIR}/pianola24bitClock.pio)
 # Modify the below lines to enable/disable output over UART/USB
 pico_enable_stdio_uart(picoTimingBoxFirmware 0)
+# pico_enable_stdio_usb can be set to 1 for debugging, but should not be left like that
+# (could lead to timeouts if nobody is listening on the other end)
 pico_enable_stdio_usb(picoTimingBoxFirmware 0)
 
 # Add the standard library to the build

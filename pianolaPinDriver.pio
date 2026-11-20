@@ -1,7 +1,5 @@
-; Use a single state machine to control when and how long a pin goes high
-; Because of a design mistake the 4 output pins are not consecutive and so my formerly elegant solution
-; of pulling in a single 32 bit word containing the 8bit pinmask and 24bit duration become a bit more cludgy
-; Instead I pull one word containing the duration, and a second word containing the pin mask.
+; A single state machine drives the four BNCs and the onboard LED.
+; Their GPIOs are nonconsecutive, so each entry uses a duration word and a GPIO mask word.
 ; To reduce the latency between triggers appearing in the fifos and the actual issuing of triggers only the instruction
 ; within the loopForTriggerDuration label actually run at a 2.56us tick rate. The effective 384X clock divider required 
 ; is comprised of a 12X global clock divider (80ns tick rate) that is slowed by a further factor of 32 (2.56us tick rate)
@@ -25,25 +23,21 @@ issueTrigger:
     out pins, 32                        ; Push pin mask to the outputs
 loopForTriggerDuration:
     jmp x-- loopForTriggerDuration [31] ; Decrement counter by one (1 cycle), and delay for an extra 31 cycles (2.56us)
-; We don't acutally need a jump to get into resetPins. Once x is 0 prior to a decrement we escape loopForTriggerDuration
-; and go to the next instruction (set pins, 0)
 resetPins:
-    set pins, 0
+    mov pins, null                      ; Clear the entire OUT range in one cycle.
     jmp waitForTrigger
 
 
 ;; write the sdk
 % c-sdk{
-static inline void pinDriver_program_init(PIO pioBlock, uint stateMachine, uint stateMachineOffset, uint firstPin, uint lastPin, uint32_t clkDivisorFP)
+static inline void pinDriver_program_init(PIO pioBlock, uint stateMachine, uint stateMachineOffset, uint firstPin, uint pinSpan, uint32_t outputGpioMask, uint32_t clkDivisorFP)
     {
         // helper function for the pinDriver.pio program
         // configure the state machine using a bog standard configuration
         pio_sm_config config = pinDriver_program_get_default_config(stateMachineOffset);
 
-        // map the outputs to the "PINS" destination of the "SET" and "OUT" commands
-        uint numPins = lastPin - firstPin + 1; 
-        sm_config_set_set_pins(&config, firstPin, numPins);
-        sm_config_set_out_pins(&config, firstPin, numPins);
+        // OUT and MOV share the same output range.
+        sm_config_set_out_pins(&config, firstPin, pinSpan);
 
         // set clock divider
         // clock divider is 16:8 Fixed Point integer
@@ -51,14 +45,16 @@ static inline void pinDriver_program_init(PIO pioBlock, uint stateMachine, uint 
         uint8_t clkDivisorFRAC = clkDivisorFP & 0xFF;
         sm_config_set_clkdiv_int_frac8(&config, clkDivisorINT, clkDivisorFRAC);
 
-        // intialise the gpio pins
-        for (int pin = firstPin; pin < (lastPin+1); pin++)
-        {
-            pio_gpio_init(pioBlock, pin);
-        }
-
-        // init the state machine but dont enable it. We do that in sync with the clock pio program
-        pio_sm_set_consecutive_pindirs(pioBlock, stateMachine, firstPin, numPins, true);
+        // Initialise the output levels and directions before handing the pins to PIO.
         pio_sm_init(pioBlock, stateMachine, stateMachineOffset, &config);
+        pio_sm_set_pins_with_mask(pioBlock, stateMachine, 0, outputGpioMask);
+        pio_sm_set_pindirs_with_mask(pioBlock, stateMachine, outputGpioMask, outputGpioMask);
+        for (uint pin = firstPin; pin < firstPin + pinSpan; pin++)
+        {
+            if (outputGpioMask & (1u << pin))
+            {
+                pio_gpio_init(pioBlock, pin);
+            }
+        }
     }    
 %}

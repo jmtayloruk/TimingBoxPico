@@ -52,6 +52,12 @@ noticed when designing the PCB layout so there's some less than elegant code to 
 #define OUTPUT_3_PIN 15
 #define IRQ_PIANOLACORE 46
 
+// GPIO pin index used for each output pin as indexed in GET_PinSource.
+// (n.b. currently the source for each pin is hard-mapped to the equivalent pianola bit)
+static const uint pianolaOutputPins[] = {
+    OUTPUT_0_PIN, OUTPUT_1_PIN, OUTPUT_2_PIN, OUTPUT_3_PIN, ONBOARD_LED_PIN
+};
+
 // ===============================================================================
 // Set up some pianola attributes
 //================================================================================
@@ -114,11 +120,9 @@ enum STATUS pianolaStatus = INIT;
 int pianolaFirmwareVersion = 6;
 int pianolaFirmwareEarliestVersion = 6;
 
-// pin sources
-// relating to pin source
-uint8_t pianolaPinIdx;
-uint8_t pianolaPinBitMap;
-uint8_t pianolaPinInvert;
+// XMOS protocol source index for constant low
+// We report this back in response to a GET_PinSource command for a pin we don't implement.
+#define PIN_SOURCE_OFF 29
 
 // piv params
 uint8_t pivIdx;
@@ -166,13 +170,6 @@ enum CMD_SET
 // ===============================================================================
 // Helper Functions That need to be decalred before the parsers
 //================================================================================
-
-void flashLED(int LEDpin, int delayMS)
-{
-    gpio_put(ONBOARD_LED_PIN, false);
-    sleep_ms(delayMS);
-    gpio_put(ONBOARD_LED_PIN, true);
-}
 
 void updateStatusLED(void)
 {
@@ -283,30 +280,27 @@ static uint32_t read_be32(const unsigned char *p)
          | (uint32_t)p[3];
 }
 
-uint32_t remapPinMask(unsigned char oldPinMask)
+uint32_t remapPinMask(unsigned char pianolaMask)
 {
-    // Since pins are not consecutive I need to convert the 4bit pin mask into a 32 bit word
-    uint outputList[4] = {OUTPUT_0_PIN, OUTPUT_1_PIN, OUTPUT_2_PIN, OUTPUT_3_PIN};
-    uint32_t newPinMask = 0;
-    for (int i = 0; i < 4; i++)
+    // PIO output bits are relative to the first BNC GPIO.
+    uint32_t pinMask = 0;
+    for (uint bit = 0; bit < count_of(pianolaOutputPins); bit++)
     {
-        // get ith bit of the pin mask and remap to the corresponding gpio output pin
-        // indexed from the first output
-        newPinMask += ((oldPinMask >> i) & 0x1) << (outputList[i] - OUTPUT_0_PIN);
+        pinMask |= ((pianolaMask >> bit) & 0x1) << (pianolaOutputPins[bit] - OUTPUT_0_PIN);
     }
-    return newPinMask;
+    return pinMask;
 }
 
-// the big yin
 void CommandParser(unsigned char *ptrDataReceived, unsigned char *ptrDataResponse)
 {
+    // Large function that implements the parsing of each opcode that we could be sent, and acting on that command
     enum CMD_SET opcode = ptrDataReceived[0] & 0xFF;
     uint8_t bytesToRespond = 0;
     switch(opcode)
     {
         case SET_Pianola:
             uint32_t pianolaSetAddress = ptrDataReceived[1];
-            uint32_t pianolaPinMask = remapPinMask(ptrDataReceived[2] & 0x0F);
+            uint32_t pianolaPinMask = remapPinMask(ptrDataReceived[2]);
             uint32_t pianolaDuration = ptrDataReceived[3] << 16 | ptrDataReceived[4] << 8 | ptrDataReceived[5] & 0xFF;
             uint64_t pianolaEntry = 0;
             pianolaEntry += pianolaPinMask;
@@ -371,16 +365,17 @@ void CommandParser(unsigned char *ptrDataReceived, unsigned char *ptrDataRespons
             break;
 
         case SET_PinSource:
-
-            pianolaPinIdx = ptrDataReceived[1];
-            pianolaPinBitMap = ptrDataReceived[2];
-            pianolaPinInvert = ptrDataReceived[3];
+            // Accept the XMOS packet, but do not actually do anything with it.
+            // The Pico output sources are fixed, and a subsequent call to GET_PinSource
+            // will just return our fixed mapping
             break;
 
         case GET_PinSource:
+            // If we are being queried about a pin that is supported by the Pico,
+            // report that it is mapped to that numerical pin source (which is one of the pianola bits)
             bytesToRespond = 2;
-            ptrDataResponse[1] = pianolaPinBitMap;
-            ptrDataResponse[2] = pianolaPinInvert;
+            ptrDataResponse[1] = ptrDataReceived[1] < count_of(pianolaOutputPins) ? ptrDataReceived[1] : PIN_SOURCE_OFF;
+            ptrDataResponse[2] = 0;
             break;
 
         case SET_CameraClk:
@@ -605,9 +600,6 @@ void main(void)
     // Core 1 handles the running of the pianola and some command handling as well.
 
     stdio_init_all();
-    gpio_init(ONBOARD_LED_PIN);
-    gpio_set_dir(ONBOARD_LED_PIN, true);
-    gpio_put(ONBOARD_LED_PIN, true);
 
     // Red and Green channels of the status LED
     gpio_init(STATUS_LED_GREEN);
@@ -635,14 +627,15 @@ void main(void)
 
     // claim state machines for the pio programs
     //pinDriver
-    uint numPins = OUTPUT_3_PIN - OUTPUT_0_PIN + 1;
-    bool pioTriggerStart = pio_claim_free_sm_and_add_program_for_gpio_range(&pinDriver_program, &pioBlock, &smPinDriver,&offsetPinDriver, OUTPUT_0_PIN, numPins,0);
+    uint pinSpan = ONBOARD_LED_PIN - OUTPUT_0_PIN + 1;
+    uint32_t outputGpioMask = remapPinMask(UINT8_MAX) << OUTPUT_0_PIN;
+    bool pioTriggerStart = pio_claim_free_sm_and_add_program_for_gpio_range(&pinDriver_program, &pioBlock, &smPinDriver, &offsetPinDriver, OUTPUT_0_PIN, pinSpan, false);
     // pianolaClock
     bool pioClockStart = pio_claim_free_sm_and_add_program(&pianolaClock_program, &pioBlock, &smPianolaClock, &offsetPianolaClock);
     assert(pioTriggerStart & pioClockStart);
 
     // initialise the state machines but dont start yet
-    pinDriver_program_init(pioBlock, smPinDriver, offsetPinDriver, OUTPUT_0_PIN, OUTPUT_3_PIN, pinDriverClockDivisorFP);
+    pinDriver_program_init(pioBlock, smPinDriver, offsetPinDriver, OUTPUT_0_PIN, pinSpan, outputGpioMask, pinDriverClockDivisorFP);
     pianolaClock_program_init(pioBlock, smPianolaClock, offsetPianolaClock, pianolaClockDivisorFP);
 
     // start both state machines in sync
