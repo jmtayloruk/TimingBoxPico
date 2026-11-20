@@ -611,21 +611,11 @@ void pianolaManagerStep(void)
             queuePianolaEntry(pianolaPosition);
             pianolaPosition++;
         }
-        // if we get to the end of the pianola
-        // stop running if we're not repeating
-        else if(pianolaStatus == REPEATING)
-        {
-            // if we want to repeat then set to the repeat from address
-            // this defaults to 0 so its the same as going to the start
-            // else if we've set it from a command, repeat from that address till heat death
-            pianolaPosition = pianolaRepeatAddr;
-        }
         else if (pianolaRepeatFlag)
         {
-            // we were running but want to start repeating
+            // Check the repeat flag at the end of every pass.
             pianolaStatus = REPEATING;
             pianolaPosition = pianolaRepeatAddr;
-            // Preserve configured repetition across an immediate restart.
         }
         else if (pio_sm_get_pc(pioBlock, smPinDriver) ==
                  offsetPinDriver + pinDriver_wrap_target)

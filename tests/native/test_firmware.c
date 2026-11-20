@@ -166,11 +166,19 @@ static void test_scheduling_matrix(void) {
     }
 }
 static void test_repeat_off(void) {
-    entry(0,1,4);SEND(2,0);SEND(4,1);run();
-    for(unsigned i=0;i<4;i++) {expect_next(1,4,"Establish repeating state");step();}
+    entry(0,1,4);entry(1,2,8);SEND(2,1);SEND(4,1);run();
+    expect_next(1,4,"First pass start");
+    expect_next(2,8,"First pass end");
+    expect_next(1,4,"Repeat pass start");
+    CHECK(pianolaStatus==REPEATING,"Did not establish repeating state");
     SEND(4,0);
-    for(unsigned i=0;i<12;i++) {if(fifo_level>=2) consume_entry();step();}
-    CHECK(pianolaStatus!=REPEATING && fifo_level==0,"Disabling repetition did not finish the loop; still repeating after bounded drain");
+    expect_next(2,8,"Final entry of the repeat pass");
+    step();
+    CHECK(pianolaStatus==REPEATING,"Playback ended before the final entry completed");
+    active=false;driver_pc=driver_wait_pc;
+    step();step();
+    CHECK(pianolaStatus==READY && pianolaPosition==0 && fifo_level==0,
+          "Disabling repetition did not finish playback after the repeat pass");
 }
 static void test_invalid_repeat(void) {
     entry(0,1,4);SEND(2,0);SEND(3,255);SEND(4,1);run();expect_next(1,4,"Invalid-repeat first entry");
