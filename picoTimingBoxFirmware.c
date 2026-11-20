@@ -212,6 +212,50 @@ uint32_t getPianolaTime()
     return t;
 }
 
+// Core 1 owns all output-SM control. Disabling alone would only pause the
+// previous countdown; clear both queued words and in-flight execution state,
+// then explicitly reposition the PC. Never reset the independent clock SM.
+static void cancelPinDriver(void)
+{
+    pio_sm_set_enabled(pioBlock, smPinDriver, false);
+    pio_sm_clear_fifos(pioBlock, smPinDriver);
+    pio_sm_restart(pioBlock, smPinDriver);
+    pio_sm_exec_wait_blocking(pioBlock, smPinDriver,
+                             pio_encode_jmp(offsetPinDriver + pinDriver_wrap_target));
+}
+
+static void startPianola(void)
+{
+    cancelPinDriver();
+    pianolaFireTime = 0;
+    pianolaPosition = 1;
+    pianolaStatus = RUNNING;
+    // Preload one complete pair while halted. No old output pattern is applied
+    // or cleared between cancellation and the new entry-zero OUT instruction.
+    uint64_t first = pianola[0];
+    pio_sm_put(pioBlock, smPinDriver, (uint32_t)first);
+    pio_sm_put(pioBlock, smPinDriver, (uint32_t)(first >> 32));
+    pio_sm_set_enabled(pioBlock, smPinDriver, true);
+}
+
+static void stopPianola(void)
+{
+    cancelPinDriver();
+    pianolaStatus = READY;
+    pianolaPosition = 0;
+    pianolaRepeatFlag = 0;
+    pianolaFireTime = 0;
+    // Intentional XMOS difference: rewind AND apply the currently programmed
+    // entry-zero pattern, ignoring its duration. Forced PULL/OUT works while
+    // halted and updates the entire OUT range atomically in one instruction.
+    pio_sm_put(pioBlock, smPinDriver, (uint32_t)(pianola[0] >> 32));
+    pio_sm_exec_wait_blocking(pioBlock, smPinDriver, pio_encode_pull(false, true));
+    pio_sm_exec_wait_blocking(pioBlock, smPinDriver, pio_encode_out(pio_pins, 32));
+    pio_sm_exec_wait_blocking(pioBlock, smPinDriver,
+                             pio_encode_jmp(offsetPinDriver + pinDriver_wrap_target));
+    // Remain disabled: even the driver's automatic pin-clear cannot run.
+}
+
 int isTimeInFuture(uint32_t currentTime, uint32_t proposedTime)
 {
     // Compare modulo 2^24 using the XMOS half-range convention.
@@ -333,8 +377,7 @@ void CommandParser(unsigned char *ptrDataReceived, unsigned char *ptrDataRespons
 
         case RUN_Pianola:
             bytesToRespond = 3;
-            pianolaStatus = RUNNING;
-            pianolaPosition = 0;
+            startPianola();
             pianolaTime = getPianolaTime();
             ptrDataResponse[1] = (pianolaTime >> 16) & 0xFF;
             ptrDataResponse[2] = (pianolaTime >> 8) & 0xFF;
@@ -359,10 +402,7 @@ void CommandParser(unsigned char *ptrDataReceived, unsigned char *ptrDataRespons
             break;
 
         case IRQ_StopAndReset:
-            pianolaStatus = READY;
-            pianolaPosition = 0;  
-            pianolaRepeatFlag = 0;
-            pianolaFireTime = 0;
+            stopPianola();
             break;
 
         case GET_CurrentPianolaTime:
@@ -419,8 +459,10 @@ void CommandParser(unsigned char *ptrDataReceived, unsigned char *ptrDataRespons
             break;
 
         case IRQ_HARDRESET:
+            stopPianola();
             pianolaStatus = INIT;
             pianolaFinalPosition = 0;
+            pianolaNumberOfEntries = 1;
             pianolaRepeatAddr = 0;
             pianolaPosition = 0;
             break;
@@ -534,12 +576,8 @@ void pianolaManagerStep(void)
     // if we're not running an pianola and we should be soon then we should get a move on
     if ((pianolaStatus != RUNNING) && (pianolaStatus == PENDING) && (shouldRunPianolaSoon(pianolaTime, pianolaFireTime)))
     {
-        //start running from the first pianola entry
-        pianolaStatus = RUNNING;
-        pianolaPosition = 0;
-
-        // reset pianolaFireTime so we don't fire again when the clock wraps around
-        pianolaFireTime = 0;
+        // Cancellation happens at firing, not when a future start is armed.
+        startPianola();
     }
 
     // Never block playback on a full response queue or lose a pending reply.
@@ -584,10 +622,13 @@ void pianolaManagerStep(void)
             // we were running but want to start repeating
             pianolaStatus = REPEATING;
             pianolaPosition = pianolaRepeatAddr;
-            pianolaRepeatFlag = 0;
+            // Preserve configured repetition across an immediate restart.
         }
-        else // pianolaStatus was running and we should now stop
+        else if (pio_sm_get_pc(pioBlock, smPinDriver) ==
+                 offsetPinDriver + pinDriver_wrap_target)
         {
+            // FIFO empty means "consumed", not "finished". Only mark ready
+            // once the final entry has returned to the driver's wait loop.
             pianolaPosition = 0;
             pianolaStatus = READY;
         }

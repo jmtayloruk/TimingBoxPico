@@ -381,8 +381,9 @@ def human_tests(box, report, args, led):
         box.stop(); time.sleep(1.1)
         box.all_low(); time.sleep(.05)
 
-    def observation_finished():
-        box.stop()
+    def observation_finished(stop_playback=True):
+        if stop_playback:
+            box.stop()
         print('Observation finished — look back at the terminal to answer.', flush=True)
 
     def blink():
@@ -406,14 +407,14 @@ def human_tests(box, report, args, led):
         box.upload([(led, ticks(.25)), (0, ticks(.75))], repeat=True)
         ready_to_watch('STOP CHECK: After Return, watch for 7 seconds. The LED should blink for\n'
                        'about 4 seconds, then stop blinking and remain steady for the rest.\n'
-                       'Steady ON or steady OFF is acceptable. No input is needed during viewing.')
+                       'It should freeze ON (entry zero is ON). No input is needed during viewing.')
         box.run()
         time.sleep(4)
         box.stop()
         time.sleep(3)
         observation_finished()
-        ask('Did the LED first blink, then stop and remain steady during the final few seconds?')
-    report.test('led_stop', 'visible stop; steady level allowed', stop, human=True)
+        ask('Did the LED first blink, then stop and remain continuously ON during the final few seconds?')
+    report.test('led_stop', 'visible stop; freeze entry-zero ON pattern', stop, human=True)
 
     def replacement():
         prepare_dark()
@@ -447,7 +448,9 @@ def human_tests(box, report, args, led):
         time.sleep(3)
         box.run()
         time.sleep(8)
-        observation_finished()
+        # This one-shot is already finished. StopAndReset would intentionally
+        # apply its ON entry zero again, falsely appearing to be a restart glitch.
+        observation_finished(stop_playback=False)
         ask('Was the LED continuously ON for about 7 seconds, then OFF for the rest, without gaps or relighting?')
     report.test('led_restart', 'one-shot restart extends a continuous ON interval', restart, human=True)
 

@@ -149,9 +149,11 @@ The tests include:
 Live-edit safety tests do not prescribe immediate versus deferred versus ignored
 edits. They check bounded state/index/FIFO behaviour and continued command service.
 Other tests deliberately require stop/restart/pending-start replacement to work.
-The stop-queued test requires that a queued successor cannot execute after stop;
-it does not demand an arbitrary all-low output policy. Reset must clear repeat
-and pending configuration. Invalid repeat ranges must not leave playback stuck
+Stop must cancel active/queued work, rewind to entry zero, apply its pattern and
+hold it indefinitely with the output SM disabled. This includes a nonzero entry
+zero and stop after natural completion. It deliberately differs from XMOS, which
+retains the last applied pianola pattern. Reset must clear repeat and pending
+configuration. Invalid repeat ranges must not leave playback stuck
 active indefinitely; rejecting/clamping/stopping are all possible solutions.
 
 The refill timing experiments use **requested durations and an assumed four-tick
@@ -276,8 +278,9 @@ Before **each** check, the script stops previous activity, executes an explicit
 low pattern, prints the complete instructions, and waits for Return. The LED
 should be OFF while you read. Enter `n` if the starting state is wrong or `s` to
 skip without starting. Once you press Return, watch only the LED: there are no
-mid-window questions or new instructions. After viewing, the script stops playback
-and asks retrospective questions.
+mid-window questions or new instructions. After viewing, the script stops repeating playback
+and asks retrospective questions. The one-shot restart check is left finished:
+StopAndReset would relight its ON entry zero and create a misleading late flash.
 
 1. A burst-uploaded, scheduled 1 Hz pattern, ON for roughly 25% of each cycle.
    After Return there is about half a second OFF, then five seconds of flashing.
@@ -285,7 +288,7 @@ and asks retrospective questions.
    serial latency does not normally prevent the waveform being observed. It is
    not a test of accepting a short-lead request.
 2. A fresh blinking pattern for four seconds, followed by stop; observe three
-   more seconds of steady output. Steady ON or OFF is allowed.
+   more seconds of steady ON output: entry zero is ON, so StopAndReset must freeze ON.
 3. Replace a 2-second pending start with a 6-second one. Observe the whole
    ten-second window without looking back at the terminal: OFF for about six
    seconds, then blinking. Both questions are asked afterwards, so the prompt
@@ -342,3 +345,30 @@ python3 tests/run_tests.py --filter upload_burst
 
 These are deterministic checks of the actual polling/queue code, not a proof
 about physical interrupt latency. Rerun the connected burst test after flashing.
+
+## Stop/restart cancellation tests
+
+`cancelPinDriver()` disables only the output SM, clears its FIFOs, restarts its
+internal delay/shift state, and forces a jump to the generated wrap-target entry
+point. Stop then forces a PULL/OUT of entry zero's pattern while halted and leaves
+the SM disabled. Start preloads the first duration/pattern pair before enabling.
+No PIO assembly changes or additional instructions are added to normal playback.
+The independent clock SM is never cancelled or restarted.
+
+Tests exercise 200 stop and 50 restart combinations of PC, FIFO occupancy
+(including half-consumed pairs), stale delay/shift state and output pattern.
+The fake peripheral now records enable/clear/restart/forced instructions, preserves
+PC on hardware restart, models the forced PULL/OUT/JMP subset, and separately
+records status LEDs and sequence-controlled outputs. These are API/state checks,
+not a cycle-accurate CPU/peripheral race simulation. Existing instruction-model
+and occasional physical capture checks remain complementary.
+
+Additional tests cover repeated stop/start, restart during repetition, cancellation
+at scheduled firing (not at arming), stop when already ready, and final-entry
+consumption versus completion. The final READY transition waits until FIFO-empty
+and the PC has returned to the output program's wait-loop entry point; arbitrary
+new PIO control flow would need this completion condition reviewed.
+
+```sh
+python3 tests/run_tests.py --filter control
+```

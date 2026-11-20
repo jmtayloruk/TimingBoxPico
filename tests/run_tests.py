@@ -29,7 +29,9 @@ def generate_headers(build, pianolas):
         m = re.search(r'%\s*c-sdk\s*\{(.*?)%\}', source, re.S)
         if not m:
             raise RuntimeError(f'{name}: cannot find embedded C SDK initialiser')
-        (build / f'{name}.pio.h').write_text(m[1])
+        program = re.search(r'^\.program\s+(\w+)', source, re.M)[1]
+        wrap_target = Pio(ROOT / f'{name}.pio').wrap_target
+        (build / f'{name}.pio.h').write_text(f'#define {program}_wrap_target {wrap_target}\n' + m[1])
     records = []
     paths = sorted(pianolas.glob('*.txt'))
     if not paths:

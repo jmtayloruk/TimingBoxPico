@@ -184,6 +184,7 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual([e for e in restart if e[0]=='run'],[('run',),('run',)])
         self.assertIn(('sleep',3),restart)
         self.assertIn(('sleep',8),restart)
+        self.assertNotIn(('stop',),restart,'Stopping after the viewing window would relight ON entry zero')
 
     def test_readiness_skip_wrong_start_and_eof(self):
         for answer,exception in [('s',hw.ObservationSkipped),('n',hw.Failure)]:

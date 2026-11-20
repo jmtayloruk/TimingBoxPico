@@ -158,3 +158,26 @@ core 0), so it is optional and its timing under load requires device validation.
 It is not a guaranteed recovery path for a completely wedged firmware; BOOTSEL
 with a physical reset/power cycle or an SWD debug probe remains the fallback.
 No watchdog has been added by this change.
+
+## Stop and restart semantics
+
+`StopAndResetPianola` now cancels the output state machine's active and queued
+work, rewinds to entry zero, applies that entry's output pattern, and freezes on
+it. Its duration is ignored while stopped; a nonzero pattern remains asserted.
+Pending starts and repetition are cancelled. Stored entries are preserved. The
+held pattern is a snapshot at stop, not an automatic subscription to later edits.
+This deliberately differs from the reference XMOS stop handler, which rewinds
+its position but retains the previously applied pattern.
+
+Immediate run/restart discards old in-flight work, preloads entry zero and begins
+again without inserting an all-low pattern. Configured repetition survives a
+restart. Scheduled firing uses the same cancellation/start path at firing time.
+Hard reset also cancels the output pipeline through the stop path before resetting
+its existing software configuration. None of these operations restarts the
+independent clock SM or reboots the CPU.
+
+A transition emitted before the output SM is disabled cannot be undone. These
+semantics take effect when core 1 services the command; they do not promise zero
+UART/command latency. Other known PIO timing/automatic-clear issues remain: this
+change does not alter ordinary entry durations, between-entry clearing or final
+pattern retention at natural completion. See the native and connected test docs.

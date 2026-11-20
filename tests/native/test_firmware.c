@@ -383,8 +383,102 @@ static void test_debug_wire_order(void) {
     CHECK(!uart_context_errors,"Debug request caused UART access from core 1");
 }
 
+// Compare sequence-controlled GPIOs only; the separate status LEDs legitimately
+// change when RUNNING/READY changes and are not part of the frozen pattern.
+static uint32_t output_levels(void) {
+    return gpio_levels & ((1u<<2)|(1u<<11)|(1u<<14)|(1u<<15)|(1u<<25));
+}
+static void test_stop_freezes_entry_zero(void) {
+    entry(0,17,0xFFFFFF);entry(1,2,1000);entry(2,4,1000);SEND(2,2);run();
+    expect_next(17,0xFFFFFF,"Entry-zero start");step();expect_next(2,1000,"Different active pattern");step();
+    CHECK(fifo_level==2,"Expected queued successor before stop");
+    SEND(7);
+    uint32_t expected=expected_mask(17)<<2;
+    CHECK(output_levels()==expected,"Stop must apply nonzero entry-zero pattern, expected GPIO=0x%x got 0x%x",expected,gpio_levels);
+    CHECK(!active && !sm_enabled[0] && !fifo_level,"Stop retained active/queued work or left output SM enabled");
+    CHECK(pianolaPosition==0 && pianolaStatus==READY && !pianolaFireTime && !pianolaRepeatFlag,"Stop did not rewind/cancel pending/repeat state");
+    for(unsigned i=0;i<100;i++) {fake_time+=100;step();CHECK(!consume_entry(),"Stopped driver consumed a new entry");}
+    CHECK(output_levels()==expected,"Stopped entry-zero pattern was not held indefinitely");
+    CHECK(!clock_control_changes && sm_enabled[1],"Stop modified the independent clock state machine");
+}
+static void test_stop_inflight_matrix(void) {
+    const unsigned masks[]={0,1,16,31};offsetPinDriver=3;
+    // PCs cover status polling, each PULL/OUT boundary, countdown and pin-clear.
+    // Odd FIFO levels represent a duration already pulled with mask still queued.
+    for(unsigned m=0;m<count_of(masks);m++) for(unsigned pc=0;pc<10;pc++) for(unsigned words=0;words<=4;words++) {
+        entry(0,masks[m],0xFFFFFF);sm_enabled[0]=true;active=true;
+        driver_pc=offsetPinDriver+pc;driver_delay=31;driver_osr=0xDEADBEEF;driver_shift_count=19;
+        gpio_levels=expected_mask(2)<<2;fifo_level=words;
+        for(unsigned i=0;i<words;i++) fifo[i]=0xBAD00000+i;
+        unsigned controls_before=control_count;SEND(7);
+        CHECK(!sm_enabled[0] && !active && !fifo_level && !driver_delay,"Stop left in-flight state at PC=%u FIFO=%u",pc,words);
+        CHECK(driver_pc==offsetPinDriver+pinDriver_wrap_target,"Stop failed to reposition PC from %u",pc);
+        CHECK(output_levels()==(expected_mask(masks[m])<<2),"Stop wrong entry-zero pattern for mask %u, PC %u, FIFO %u",masks[m],pc,words);
+        CHECK(controls[controls_before].op=='E' && !controls[controls_before].value && controls[controls_before+1].op=='C' && controls[controls_before+2].op=='R',"Cancellation must disable, clear, restart in order");
+    }
+    CHECK(!clock_control_changes,"Cancellation matrix disturbed clock SM");
+}
+static void test_restart_inflight_matrix(void) {
+    offsetPinDriver=3;entry(0,1,1000);entry(1,2,4);SEND(2,1);
+    for(unsigned pc=0;pc<10;pc++) for(unsigned words=0;words<=4;words++) {
+        sm_enabled[0]=true;active=true;driver_pc=offsetPinDriver+pc;
+        driver_delay=31;driver_osr=0xBAD;driver_shift_count=19;
+        gpio_levels=expected_mask(1)<<2;fifo_level=words;
+        for(unsigned i=0;i<words;i++) fifo[i]=0xBAD00000+i;
+        unsigned before=control_count;run();
+        CHECK(!active && !driver_delay && !driver_shift_count,"Restart resumed old in-flight state at PC=%u FIFO=%u",pc,words);
+        CHECK(driver_pc==offsetPinDriver+pinDriver_wrap_target && sm_enabled[0],"Restart did not enable at the wait-loop entry");
+        CHECK(fifo_level==2 && fifo[0]==1000 && fifo[1]==expected_mask(1),"Restart retained old FIFO words");
+        CHECK(output_levels()==(expected_mask(1)<<2),"Restart inserted an output change before entry-zero OUT");
+        CHECK(controls[before].op=='E' && !controls[before].value && controls[before+1].op=='C' && controls[before+2].op=='R',"Restart cancellation ordering incorrect");
+        CHECK(controls[before+4].op=='P' && controls[before+5].op=='P' && controls[before+6].op=='E' && controls[before+6].value,"Restart must preload a whole pair before enabling");
+        expect_next(1,1000,"Restart matrix entry zero");step();expect_next(2,4,"Restart matrix entry one");
+    }
+    CHECK(!clock_control_changes,"Restart matrix disturbed clock SM");
+}
+static void test_restart_repeating(void) {
+    entry(0,1,4);entry(1,2,8);SEND(2,1);SEND(4,1);run();
+    for(unsigned i=0;i<6;i++) expect_next(i%2?2:1,i%2?8:4,"Establish repetition");
+    step();CHECK(pianolaStatus==REPEATING,"Did not establish repeating state");run();
+    for(unsigned i=0;i<10;i++) expect_next(i%2?2:1,i%2?8:4,"Restart retains configured repetition");
+}
+static void test_scheduled_restart_discards_old(void) {
+    prepare_active();fake_time=100;step();SEND(6,0,4,0);
+    CHECK(active && fifo_level==2,"Scheduling cancelled existing in-flight work before deadline");
+    fake_time=1024;step();
+    CHECK(!active && fifo_level==2 && fifo[0]==1000 && fifo[1]==expected_mask(1),"Scheduled firing retained old active/queued work");
+    expect_next(1,1000,"Scheduled restart entry zero");
+}
+static void test_stop_then_start(void) {
+    entry(0,16,4);entry(1,1,8);SEND(2,1);
+    for(unsigned cycle=0;cycle<50;cycle++) {
+        run();expect_next(16,4,"Repeated start");step();SEND(7);
+        CHECK(!sm_enabled[0] && output_levels()==(1u<<25),"Repeated stop failed to freeze LED-high entry zero");
+    }
+}
+static void test_completion_not_fifo_empty(void) {
+    entry(0,1,1000);SEND(2,0);run();expect_next(1,1000,"Final entry in flight");step();
+    CHECK(pianolaStatus==RUNNING,"FIFO consumption was incorrectly treated as final-entry completion");
+    active=false;driver_pc=driver_wait_pc;step();
+    CHECK(pianolaStatus==READY,"Finished final entry did not transition to READY at the wait loop");
+}
+static void test_stop_after_ready(void) {
+    entry(0,16,4);entry(1,1,8);SEND(2,1);run();
+    expect_next(16,4,"Final-state setup 0");expect_next(1,8,"Final-state setup 1");
+    active=false;driver_pc=driver_wait_pc;step();CHECK(pianolaStatus==READY,"Expected ready state");
+    SEND(7);CHECK(output_levels()==(1u<<25) && !sm_enabled[0],"Stop while already ready did not apply entry-zero pattern");
+}
+
 typedef struct {const char *name,*area;void (*fn)(void);} test;
 static const test tests[]={
+ {"stop_freeze_entry_zero","Control / apply and indefinitely hold entry zero, including nonzero outputs",test_stop_freezes_entry_zero},
+ {"stop_inflight_matrix","Control / stop at 200 PC/FIFO/pattern combinations",test_stop_inflight_matrix},
+ {"restart_inflight_matrix","Control / restart at 50 PC/FIFO combinations without glitches",test_restart_inflight_matrix},
+ {"restart_preserves_repeat","Control / restart retains configured repetition",test_restart_repeating},
+ {"scheduled_restart_cancellation","Control / discard old work at scheduled firing, not at arming",test_scheduled_restart_discards_old},
+ {"repeated_stop_start","Control / fifty stop/start cycles with entry zero high",test_stop_then_start},
+ {"completion_vs_consumption","Control / FIFO-empty does not mean final entry finished",test_completion_not_fifo_empty},
+ {"stop_when_ready","Control / stop after natural completion still applies entry zero",test_stop_after_ready},
  {"full_wire_upload","UART / full 256-entry upload with asymmetric core scheduling",test_full_wire_upload},
  {"debug_reply_wire_order","UART / complete debug dump before next response",test_debug_wire_order},
  {"core0_foreground","UART / actual foreground loop, no interrupt reentrancy",test_core0_foreground},

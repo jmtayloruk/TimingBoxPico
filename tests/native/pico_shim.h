@@ -26,8 +26,19 @@ static uint32_t fake_time, fifo[4], submitted[20000];
 static unsigned fifo_level, submitted_count, violations, dropped, context;
 static unsigned uart_context_errors, block_on_empty, tx_count, rx_pos, rx_count;
 static unsigned char rx[8192], tx[16384];
-static uint32_t gpio_levels, gpio_directions, gpio_functions, output_base, output_count;
+static uint32_t gpio_levels, gpio_directions, gpio_functions, output_base=2, output_count=24;
+static void fault(const char *reason);
 static bool active;
+static bool sm_enabled[2] = {true, true};
+static uint32_t driver_pc, driver_wait_pc, driver_delay, driver_osr, driver_shift_count;
+static unsigned clock_control_changes;
+static unsigned control_count;
+static struct { char op; uint sm; uint32_t value; } controls[20000];
+static void control(char op,uint sm,uint32_t value) {
+    if(control_count>=count_of(controls)) fault("Control trace exhausted");
+    controls[control_count].op=op;controls[control_count].sm=sm;controls[control_count++].value=value;
+    if(sm==1) clock_control_changes++;
+}
 static uint32_t active_duration, active_mask;
 static unsigned clock_requests;
 static unsigned irq_handler_registrations, uart_irq_enabled, cpu_uart_irq_enabled;
@@ -78,7 +89,7 @@ static void pio_sm_put(PIO p,unsigned sm,uint32_t value) {
     if(sm==1) {clock_requests++; return;}
     if(fifo_level==4) { violations++; return; }
     if(submitted_count==count_of(submitted)) fault("test event budget exhausted");
-    fifo[fifo_level++]=value; submitted[submitted_count++]=value;
+    control('P',sm,value);fifo[fifo_level++]=value; submitted[submitted_count++]=value;
 }
 static void pio_sm_put_blocking(PIO p,unsigned sm,uint32_t v) { pio_sm_put(p,sm,v); }
 static uint32_t pio_sm_get_blocking(PIO p,unsigned sm) {
@@ -86,14 +97,44 @@ static uint32_t pio_sm_get_blocking(PIO p,unsigned sm) {
     return 0xFFFFFFu-(fake_time&0xFFFFFFu);
 }
 static void pio_sm_drain_tx_fifo(PIO p,unsigned sm) { (void)p; if(sm==0) fifo_level=0; }
-static void pio_sm_clear_fifos(PIO p,unsigned sm) { pio_sm_drain_tx_fifo(p,sm); }
-static void pio_sm_restart(PIO p,unsigned sm) { (void)p; if(sm==0) active=false; }
-static void pio_sm_set_enabled(PIO p,unsigned sm,bool enabled) { (void)p;(void)sm;(void)enabled; }
+static void pio_sm_clear_fifos(PIO p,unsigned sm) {
+    if(sm_enabled[sm]) fault("Clear FIFO requires disabled state machine");
+    control('C',sm,0);pio_sm_drain_tx_fifo(p,sm);
+}
+static void pio_sm_restart(PIO p,unsigned sm) {
+    (void)p;control('R',sm,0);
+    // Hardware restart does NOT reset the PC, X/Y or OSR contents.
+    if(sm==0) {active=false;driver_delay=0;driver_shift_count=0;}
+}
+static void pio_sm_set_enabled(PIO p,unsigned sm,bool enabled) { (void)p;control('E',sm,enabled);sm_enabled[sm]=enabled; }
+static unsigned pio_sm_get_pc(PIO p,unsigned sm) { (void)p;return sm==0?driver_pc:0; }
+#define pio_pins 0
+static uint pio_encode_jmp(uint address) { return address&31; }
+static uint pio_encode_pull(bool conditional,bool block) { return 0x8080|((conditional?2u:0u)|(block?1u:0u))<<5; }
+static uint pio_encode_out(uint dest,uint count) { return 0x6000|(dest<<5)|(count&31); }
+static void pio_sm_exec_wait_blocking(PIO p,unsigned sm,uint instruction) {
+    (void)p;control('X',sm,instruction);
+    if(sm!=0 || sm_enabled[sm]) fault("Forced cancellation instructions must target halted output SM only");
+    if((instruction&0xE000)==0) {driver_pc=instruction&31;driver_wait_pc=driver_pc;}
+    else if(instruction==0x80A0) {
+        if(!fifo_level) fault("Forced blocking PULL without data would deadlock");
+        driver_osr=fifo[0];memmove(fifo,fifo+1,(--fifo_level)*sizeof(*fifo));driver_shift_count=0;
+    }
+    else if(instruction==0x6000) {
+        uint32_t mask=(output_count==32?UINT32_MAX:((1u<<output_count)-1))<<output_base;
+        gpio_levels=(gpio_levels&~mask)|((driver_osr<<output_base)&mask);
+        driver_osr=0;driver_shift_count=32;
+    }
+    else fault("Unsupported forced instruction in native shim");
+}
 /* An entry can be active while the FIFO already contains its successor. Tests
  * choose when the active entry completes, without assuming PIO timing is correct. */
 static bool consume_entry(void) {
-    if(fifo_level<2) return false;
-    active=true; active_duration=fifo[0]; active_mask=fifo[1];
+    if(!sm_enabled[0] || fifo_level<2) return false;
+    if(driver_delay) fault("Old instruction delay resumed instead of a clean start");
+    active=true; active_duration=fifo[0]; active_mask=fifo[1];driver_pc=driver_wait_pc+7;
+    uint32_t mask=(output_count==32?UINT32_MAX:((1u<<output_count)-1))<<output_base;
+    gpio_levels=(gpio_levels&~mask)|((active_mask<<output_base)&mask);
     memmove(fifo,fifo+2,(fifo_level-2)*sizeof(*fifo)); fifo_level-=2; return true;
 }
 static void gpio_put(unsigned pin,bool v) { if(v) gpio_levels|=1u<<pin; else gpio_levels&=~(1u<<pin); }
@@ -108,7 +149,7 @@ static pio_sm_config pianolaClock_program_get_default_config(unsigned o) { (void
 static void sm_config_set_out_pins(pio_sm_config *c,unsigned b,unsigned n) { if(n>32 || b>31) fault("invalid PIO OUT range"); c->base=b;c->count=n; }
 static void sm_config_set_set_pins(pio_sm_config *c,unsigned b,unsigned n) { (void)b; if(n>5) fault("PIO SET count exceeds five pins"); c->set_count=n; }
 static void sm_config_set_clkdiv_int_frac8(pio_sm_config *c,unsigned i,unsigned f) { c->div_int=i;c->div_frac=f; }
-static void pio_sm_init(PIO p,unsigned sm,unsigned o,const pio_sm_config *c) { (void)p;(void)o; if(sm==0) {output_base=c->base;output_count=c->count;} }
+static void pio_sm_init(PIO p,unsigned sm,unsigned o,const pio_sm_config *c) { (void)p;(void)o; sm_enabled[sm]=false;if(sm==0) {output_base=c->base;output_count=c->count;driver_pc=o;driver_wait_pc=o;} }
 static void stdio_init_all(void) {}
 static void sleep_us(unsigned n) { (void)n; }
 static void uart_init(int id,unsigned baud) { (void)id;(void)baud; }
@@ -120,7 +161,7 @@ static void uart_set_irq_enables(int id,bool a,bool b) { (void)id;uart_irq_enabl
 static const int pinDriver_program=0, pianolaClock_program=1;
 static bool pio_claim_free_sm_and_add_program_for_gpio_range(const int *a,PIO *p,uint *sm,uint *o,uint b,uint n,bool v) { (void)a;(void)p;(void)b;(void)n;(void)v;*sm=0;*o=0;return true; }
 static bool pio_claim_free_sm_and_add_program(const int *a,PIO *p,uint *sm,uint *o) { (void)a;(void)p;*sm=1;*o=0;return true; }
-static void pio_enable_sm_mask_in_sync(PIO p,uint32_t m) { (void)p;(void)m; }
+static void pio_enable_sm_mask_in_sync(PIO p,uint32_t m) { (void)p;for(unsigned sm=0;sm<2;sm++) if(m&(1u<<sm)) sm_enabled[sm]=true; }
 static void multicore_launch_core1(void (*fn)(void)) { (void)fn; if(!startup_through_core0) fault("firmware startup reached core-1 launch"); }
 static void tight_loop_contents(void) { if(startup_through_core0) fault("core-0 foreground loop reached"); }
 #include "pianolaPinDriver.pio.h"
