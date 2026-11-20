@@ -35,8 +35,6 @@ noticed when designing the PCB layout so there's some less than elegant code to 
 // Defines for UART Control and GPIOs
 // ===================================================================================
 
-#define picoCPUclkRateMHz 150
-
 // UART defines
 // bog standard 8n1 @ 115200
 #define UART_ID uart0
@@ -56,7 +54,6 @@ noticed when designing the PCB layout so there's some less than elegant code to 
 #define OUTPUT_1_PIN 11
 #define OUTPUT_2_PIN 14
 #define OUTPUT_3_PIN 15
-#define IRQ_PIANOLACORE 46
 
 // ===============================================================================
 // Set up some pianola attributes
@@ -81,10 +78,7 @@ enum STATUS
     INIT = 0,
     READY,
     RUNNING,
-    REPEATING,
-    STOPPED,
-    RESET,
-    PANIC
+    REPEATING
 };
 
 uint8_t pianolaRepeatFlag = 0;
@@ -93,7 +87,6 @@ uint64_t pianola[256];
 uint32_t pianolaCameraClock[8];
 int pianolaFinalPosition = 0;
 int pianolaPosition = 0;
-uint32_t pianolaNumberOfEntries = 1;
 uint32_t pianolaTime;
 
 uint8_t pianolaRepeatAddr = 0;
@@ -424,7 +417,6 @@ static void hardResetPianola(void)
 
     pianolaPosition = 0;
     pianolaFinalPosition = 0;
-    pianolaNumberOfEntries = 1;
     pianolaRepeatAddr = 0;
     pianolaRepeatFlag = 0;
     pianolaFirePending = false;
@@ -533,7 +525,6 @@ void CommandParser(unsigned char *ptrDataReceived, unsigned char *ptrDataRespons
 
         case SET_PianolaFinalPos:
             pianolaFinalPosition = ptrDataReceived[1] & 0xFF;
-            pianolaNumberOfEntries = pianolaFinalPosition + 1;
             break;
 
         case SET_PianolaRepeatFrom:
@@ -634,7 +625,6 @@ void CommandParser(unsigned char *ptrDataReceived, unsigned char *ptrDataRespons
             break;
 
         case GET_FirmwareVersion:
-            //printf("Boo\n");
             bytesToRespond = 2;
             ptrDataResponse[1] = pianolaFirmwareVersion & 0xFF;
             ptrDataResponse[2] = pianolaFirmwareEarliestVersion & 0xFF;
@@ -649,7 +639,6 @@ void CommandParser(unsigned char *ptrDataReceived, unsigned char *ptrDataRespons
             break;
 
         default:
-            //printf("Not a valid response\n");
             break;
 
     };
@@ -812,16 +801,6 @@ void pianolaManagerCore1(void)
     }
 }
 
-void stabilisePianolaClock(void)
-{
-    // the clock statemachine is a bit weird for the first 30-100ms / first few gets
-    // just going to gettime a few times and then discard
-    for (int i = 0; i < 10; i++)
-    {
-        pianolaTime = getPianolaTime();
-        sleep_us(10000);
-    }
-}
 #ifdef TIMINGBOX_HOST_TEST
 #define main firmware_main
 #endif

@@ -643,7 +643,7 @@ static void test_hardreset(void) {
     CHECK(tx_count==before,"Hard reset sent an unexpected reply");
     CHECK(output_levels()==0,"Hard reset left outputs high");
     CHECK(!active && !sm_enabled[0] && !fifo_level,"Hard reset retained active or queued output work");
-    CHECK(pianolaStatus==INIT && pianolaPosition==0 && pianolaFinalPosition==0 && pianolaNumberOfEntries==1,
+    CHECK(pianolaStatus==INIT && pianolaPosition==0 && pianolaFinalPosition==0,
           "Hard reset did not restore initial playback state");
     CHECK(!pianolaRepeatAddr && !pianolaRepeatFlag && !pianolaFirePending && !pianolaFireTime,
           "Hard reset retained repeat or scheduled-start configuration");

@@ -1,4 +1,5 @@
-; A single state machine drives the four BNCs and the onboard LED.
+; A single state machine drives the four BNCs, the onboard LED and the two
+; external status-LED channels.
 ; Their GPIOs are nonconsecutive, so each FIFO entry has a zero-based duration
 ; word followed by a GPIO mask word.
 ; The 12X system clock divider gives an 80 ns PIO cycle at 150 MHz.
