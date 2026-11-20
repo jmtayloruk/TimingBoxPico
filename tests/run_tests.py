@@ -135,35 +135,83 @@ def pio_tests(binary):
             )
 
     def clock_tick_cycles():
-        for counter, expected in ((1, 0), (0, 0xFFFFFF)):
+        for counter in (0, 1, 2, 0xFFFFFF):
             for requested in (False, True):
                 p = Pio(ROOT / 'pianola24bitClock.pio')
                 p.pc = p.labels['wait1']
                 p.reg['x'] = counter
                 if requested:
                     p.tx.append(0xF)
-                p.step()
-                p.until(lambda: p.pc == p.labels['wait1'])
-                context = f'counter={counter}, request={requested}'
-                assert p.cycles == 10, f'{context}: tick took {p.cycles} cycles'
-                assert p.reg['x'] == expected, f'{context}: next counter was {p.reg["x"]:#x}'
+                # Exercise consecutive samples as well as entry into/exit from
+                # wrap, so handling a request cannot slow or freeze the clock.
+                for tick in range(4):
+                    current = p.reg['x']
+                    start = p.cycles
+                    p.step()
+                    p.until(lambda: p.pc == p.labels['wait1'])
+                    context = f'counter={counter}, request={requested}, tick={tick}'
+                    assert p.cycles - start == 12, f'{context}: tick took {p.cycles - start} cycles'
+                    expected = (current - 1) & 0xFFFFFF
+                    assert p.reg['x'] == expected, f'{context}: next counter was {p.reg["x"]:#x}'
+                    samples = [sample for _, sample in p.rx]
+                    assert samples == ([current] if requested else []), f'{context}: got samples {samples}'
+                    p.rx.clear()
+                    if requested:
+                        p.tx.append(0xF)
+
+    def clock_request_phases():
+        # Arriving after MOV STATUS must wait for the next tick. Exercise every
+        # instruction boundary of both a normal tick and the reload path, with
+        # absolute tick deadlines and independently expected timestamp values.
+        for counter in (0, 1, 0xFFFFFF):
+            probe = Pio(ROOT / 'pianola24bitClock.pio')
+            probe.pc = probe.labels['wait1']
+            probe.reg['x'] = counter
+            phases = []
+            for _ in range(32):
+                if phases and probe.pc == probe.labels['wait1']:
+                    break
+                phases.append(probe.cycles)
+                probe.step()
+            else:
+                raise AssertionError(f'counter={counter}: clock did not return to its tick boundary')
+            for arrival in phases:
+                p = Pio(ROOT / 'pianola24bitClock.pio')
+                p.pc = p.labels['wait1']
+                p.reg['x'] = counter
+                p.until(lambda: p.cycles == arrival)
+                p.tx.append(0xF)
+                for tick in range(3):
+                    p.step()
+                    p.until(lambda: p.pc == p.labels['wait1'])
+                    assert p.cycles == (tick + 1) * 12, (
+                        f'counter={counter}, arrival={arrival}: tick ended at {p.cycles} cycles'
+                    )
                 samples = [sample for _, sample in p.rx]
-                assert samples == ([counter] if requested else []), f'{context}: got samples {samples}'
+                expected = counter if arrival == 0 else (counter - 1) & 0xFFFFFF
+                assert samples == [expected], (
+                    f'counter={counter}, arrival={arrival}: expected one sample {expected:#x}, got {samples}'
+                )
+                assert not p.tx, f'Request at cycle {arrival} was not consumed'
 
     def divider():
         import re
         source = (ROOT / 'picoTimingBoxFirmware.c').read_text()
         def divisor(name):
             return int(re.search(rf'{name}\s*=\s*(0x[0-9a-fA-F]+)', source)[1], 16) / 256
-        clock = divisor('pianolaClockDivisorFP') * 10
+        clock = divisor('pianolaClockDivisorFP') * 12
         output = divisor('pinDriverClockDivisorFP') * 32
         ppm = (output / clock - 1) * 1e6
-        assert abs(ppm) < 1, f'Clock and output ticks differ by {ppm:.2f} ppm (configured divisors; absolute oscillator error not modelled)'
+        assert clock == output == 384, (
+            f'Expected both ticks to take exactly 384 system-clock cycles, got clock={clock:g}, '
+            f'output={output:g} ({ppm:.2f} ppm difference; absolute oscillator error not modelled)'
+        )
     return [
         ('functional', 'pio_adjacent_patterns', 'PIO / no inserted low between high entries', no_glitch),
         ('functional', 'pio_final_pattern', 'PIO / retain final output pattern', final_hold),
         ('functional', 'clock_sample_freshness', 'Clock PIO / fresh sample per request', clock_freshness),
-        ('functional', 'clock_tick_cycles', 'Clock PIO / ten-cycle ticks through wraparound', clock_tick_cycles),
+        ('functional', 'clock_tick_cycles', 'Clock PIO / twelve-cycle ticks through wraparound and consecutive samples', clock_tick_cycles),
+        ('functional', 'clock_request_phases', 'Clock PIO / request arrival at each normal/wrap instruction boundary', clock_request_phases),
         ('timing', 'pio_entry_spacing', 'Timing / one- and four-tick entry spacing', entry_spacing),
         ('timing', 'pio_repeat_spacing', 'Timing / entry spacing through the repeat boundary', lambda: entry_spacing(repeat=True)),
         ('timing', 'pio_final_duration', 'Timing / minimum-duration final entry reaches idle after one tick', final_duration),

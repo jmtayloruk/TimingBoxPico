@@ -1,15 +1,10 @@
 /* 
 State Machine that acts as a 24bit clock with output capturable from the main C code.
-Clock counts down from 0xffffff and wraps arround when it reaches zero.
-Each clock tick takes 10 state machine instructions (10 real clock cycles)
-Time base is then 6.667ns * 10 * clkDiv which should beat the current 1us resolution of
-the inbuild time_us_32() function. 
-In principle the bit depth of the clock is configurable. Just change the "out x, 24"
-
-To Do: For those of the twisted persuasion there's probably a cyle or two per clock tick
-that can be shaved off but caveat emptor. 
-This would likely be using some auto pushes to save an instruction
-Or if theres a smarter way to initialise the clock to all ones.
+Clock counts down from 0xffffff and wraps around when it reaches zero.
+Normal, sample-response and wrap paths each take exactly 12 PIO cycles.
+With integer divider 32, one tick is 384 system-clock cycles: 2.56 us at
+150 MHz, exactly matching the output driver's 32 cycles at divider 12.
+Keep all paths balanced if changing the instructions or the 24-bit counter.
 */
 
 .program pianolaClock
@@ -27,7 +22,7 @@ out NULL, 32; ; clear osr
 ; check status register if we need to response a time
 ; if no request or underflow then handle that
 wait1:
-    mov y, status
+    mov y, status [2]        ; common padding: all tick paths take 12 cycles
     jmp !y sendresp
     jmp !x clr0
     jmp x-- wait1 [6]
@@ -37,7 +32,7 @@ sendresp:
     pull
     mov isr, x
     push noblock
-    jmp !x reload            ; skip the padding nop to keep the wrap tick at 10 cycles
+    jmp !x reload            ; skip the padding nop to keep the wrap tick at 12 cycles
     jmp x-- wait1 [3]
 
 ;some extra labels to catch x == 0 prior to decrement

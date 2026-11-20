@@ -101,10 +101,9 @@ uint8_t pianolaRepeatAddr = 0;
 static bool pianolaFirePending;
 static uint32_t pianolaFireTime;
 
-// fixed at a 2.56us timebase to mimic the xmos
-// clock divisors represents as 24bit Fixed Point Ints - 16 Integral Bit, 8 Frac bits
-// If they need to change is relatively straightorward to do this by hand - coding its a bit of a faff
-uint32_t pianolaClockDivisorFP = 0x02666; // 38.4X clockdivider (38.3984375 due to rounding.)
+// Both timebases take exactly 384 system-clock cycles per nominal 2.56 us tick.
+// Dividers use 16 integer bits and 8 fractional bits; both are exact integers.
+uint32_t pianolaClockDivisorFP = 0x002000; // 12 PIO cycles at divider 32
 uint32_t pinDriverClockDivisorFP = 0x000C00; // 12X clockdivider
 // 32 PIO cycles per Pianola tick give a 384X effective divider.
 

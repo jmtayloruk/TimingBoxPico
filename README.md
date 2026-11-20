@@ -59,22 +59,19 @@ queued retain their previous GPIO masks. Once playback is idle, a changed route
 is applied to the held logical pattern, including when the sequence finishes
 before an entry uses the new route.
 
-## Timing model and known timebase mismatch
+## Timing model
 
-Sequence durations use nominal 2.56 us ticks. At the configured 150 MHz, an output
-tick takes exactly 384 CPU cycles: 32 PIO cycles with divider 12. The reported
-clock instead uses ten PIO cycles and a divider intended to be 38.4. Its 16.8
-fixed-point representation rounds that to 9830/256 = 38.3984375, giving an average
-clock tick of 2.559895833 us. It therefore counts about 40.69 ppm faster than the
-output timebase (about 40.7 us per second). Both use the same system clock; this
-relative scale error is separate from absolute oscillator accuracy.
+Sequence durations and the reported clock use nominal 2.56 us ticks. At the
+configured 150 MHz, both take exactly 384 system-clock cycles: the output tick
+uses 32 PIO cycles with integer divider 12, and the clock tick uses 12 PIO cycles
+with integer divider 32. Normal, sample-response and wraparound clock paths are
+balanced to the same length. Absolute accuracy still depends on the board's
+system-clock accuracy.
 
-A possible fix is a 12-cycle clock loop with integer divider 32, making both
-paths exactly 384 CPU cycles. This is **not implemented**: normal, response and
-wrap paths would all need balancing and testing. See the
-[test documentation](tests/README.md#interpreting-the-divider-warning) for the
-associated warning. Changing the existing divider alone cannot represent 38.4
-exactly.
+This removes the previous 40.69 ppm relative scale error caused by rounding a
+fractional clock divider. It does not phase-lock sequence starts to clock tick
+boundaries or remove software servicing latency. See the
+[test documentation](tests/README.md#checking-timebase-agreement) for validation.
 
 Correct output spacing assumes the next duration/mask pair arrives in time.
 If the CPU feeder is late, the current mask is held until the pair arrives;
@@ -148,7 +145,7 @@ Call: CMD = 1 byte. Response: none.
 
 ### GET_CurrentPianolaTime => 0x08
 
-Gets a fresh 24-bit clock sample from the timing box, sent most-significant byte first. See the timebase caveat above.
+Gets a fresh 24-bit clock sample from the timing box, sent most-significant byte first. See the timing model above.
 
 Call: CMD = 1 byte. Response: current pianola time = 3 bytes.
 
