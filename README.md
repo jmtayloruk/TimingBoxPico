@@ -103,3 +103,13 @@ Like the IRQ_StopAndReset command but the nuclear option. Clears any pending fir
 A short list of things that don't really interfere with the ability for the pianola to operate but are features present on other timing boxes that haven't been implemented.
 1. I never actually implemented the pin remapping function. As such, the various drop-down menues on the electronics setup do nothing for remapping or inverting the BNC's.
 2. Related to number 1 but in the spim-interface, I had intended to implement by own timing box type (and in fact there is a branch for this) that would present the correct output list in the electronics set up etc. This isn't a massive job - I just ran out of time.
+
+## Native regression tests
+
+Run `python3 tests/run_tests.py` on macOS without a Pico or Pico SDK. The suite
+runs the actual firmware C with fake peripherals and checks the actual PIO source
+with a limited instruction model. Functional failures and timing warnings are
+reported separately. Existing bugs deliberately produce failures.
+
+See [tests/README.md](tests/README.md) for prerequisites, filters, exit codes,
+coverage, limitations and occasional hardware-validation guidance.

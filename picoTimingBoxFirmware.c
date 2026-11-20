@@ -11,6 +11,9 @@ Namely, that state machine that drives the outputs needed to use consecutive GPI
 noticed when designing the PCB layout so there's some less than elegant code to account for this.
 */
 
+#ifdef TIMINGBOX_HOST_TEST
+#include "tests/native/pico_shim.h"
+#else
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -24,6 +27,8 @@ noticed when designing the PCB layout so there's some less than elegant code to 
 #include "pico/util/queue.h"
 #include <pianolaPinDriver.pio.h>
 #include <pianola24bitClock.pio.h>
+
+#endif
 
 // ===================================================================================
 // Defines for UART Control and GPIOs
@@ -503,83 +508,90 @@ void uartHandlerCore0(void)
     }
 }
 
+// One iteration is shared by the device loop and deterministic native tests.
+// Keep all playback decisions here; the test shim substitutes peripherals only.
+void pianolaManagerStep(void)
+{
+    updateStatusLED();
+    // if its time to change pianola state, we should do that now
+    pianolaTime = getPianolaTime();
+    // if we're not running an pianola and we should be soon then we should get a move on
+    if ((pianolaStatus != RUNNING) && (pianolaStatus == PENDING) && (shouldRunPianolaSoon(pianolaTime, pianolaFireTime)))
+    {
+        //start running from the first pianola entry
+        pianolaStatus = RUNNING;
+        pianolaPosition = 0;
+
+        // reset pianolaFireTime so we don't fire again when the clock wraps around
+        pianolaFireTime = 0;
+    }
+
+    // if theres a command sitting waiting to be processed
+    if (!queue_is_empty(&commandQ))
+    {
+        // allocate buffers for data we've just received, and the response
+        unsigned char* inBufferCore1 = malloc(32*sizeof(unsigned char));
+        unsigned char* outBufferCore1 = malloc(32*sizeof(unsigned char));
+        bool removeFlagCore1 = queue_try_remove(&commandQ, inBufferCore1);
+
+        //process the command and form the response
+        CommandParser(inBufferCore1, outBufferCore1);
+
+        // if we have a response add it too the queue
+        bool addFlagCore1 = false;
+
+        if (*outBufferCore1 > 0)
+        {
+            addFlagCore1 = queue_try_add(&responseQ, outBufferCore1);
+        }
+
+        //free buffers
+        free(inBufferCore1);
+        free(outBufferCore1);
+
+        //hand over to UART interrupt handler
+        uartHandlerCore0();
+    }
+    //if theres an instruction to execute / we're currently running
+    if ((pianolaStatus == RUNNING | pianolaStatus == REPEATING) && pio_sm_is_tx_fifo_empty(pioBlock, smPinDriver))
+    {
+        if (pianolaPosition <= pianolaFinalPosition)
+        {
+            uint32_t duration = pianola[pianolaPosition] & 0xFFFFFFFF;
+            uint32_t pinMask = pianola[pianolaPosition] >> 32;
+            pio_sm_put(pioBlock, smPinDriver, duration);
+            pio_sm_put(pioBlock, smPinDriver, pinMask);
+            pianolaPosition++;
+        }
+        // if we get to the end of the pianola
+        // stop running if we're not repeating
+        else if(pianolaStatus == REPEATING)
+        {
+            // if we want to repeat then set to the repeat from address
+            // this defaults to 0 so its the same as going to the start
+            // else if we've set it from a command, repeat from that address till heat death
+            pianolaPosition = pianolaRepeatAddr;
+        }
+        else if (pianolaRepeatFlag)
+        {
+            // we were running but want to start repeating
+            pianolaStatus = REPEATING;
+            pianolaPosition = pianolaRepeatAddr;
+            pianolaRepeatFlag = 0;
+        }
+        else // pianolaStatus was running and we should now stop
+        {
+            pianolaPosition = 0;
+            pianolaStatus = READY;
+        }
+    }
+}
+
 void pianolaManagerCore1(void)
 {
-    while(true)
+    while (true)
     {
-        updateStatusLED();
-        // if its time to change pianola state, we should do that now
-        pianolaTime = getPianolaTime();
-        // if we're not running an pianola and we should be soon then we should get a move on
-        if ((pianolaStatus != RUNNING) && (pianolaStatus == PENDING) && (shouldRunPianolaSoon(pianolaTime, pianolaFireTime)))
-        {
-            //start running from the first pianola entry
-            pianolaStatus = RUNNING;
-            pianolaPosition = 0;
-
-            // reset pianolaFireTime so we don't fire again when the clock wraps around
-            pianolaFireTime = 0;
-        }
-
-        // if theres a command sitting waiting to be processed 
-        if (!queue_is_empty(&commandQ))
-        {
-            // allocate buffers for data we've just received, and the response
-            unsigned char* inBufferCore1 = malloc(32*sizeof(unsigned char));
-            unsigned char* outBufferCore1 = malloc(32*sizeof(unsigned char));
-            bool removeFlagCore1 = queue_try_remove(&commandQ, inBufferCore1);
-
-            //process the command and form the response
-            CommandParser(inBufferCore1, outBufferCore1);
-
-            // if we have a response add it too the queue
-            bool addFlagCore1 = false;
-
-            if (*outBufferCore1 > 0)
-            {
-                addFlagCore1 = queue_try_add(&responseQ, outBufferCore1);
-            }
-
-            //free buffers
-            free(inBufferCore1);
-            free(outBufferCore1);
-
-            //hand over to UART interrupt handler
-            uartHandlerCore0();
-        }
-        //if theres an instruction to execute / we're currently running
-        if ((pianolaStatus == RUNNING | pianolaStatus == REPEATING) && pio_sm_is_tx_fifo_empty(pioBlock, smPinDriver))
-        {
-            if (pianolaPosition <= pianolaFinalPosition)
-            {
-                uint32_t duration = pianola[pianolaPosition] & 0xFFFFFFFF;
-                uint32_t pinMask = pianola[pianolaPosition] >> 32;
-                pio_sm_put(pioBlock, smPinDriver, duration);
-                pio_sm_put(pioBlock, smPinDriver, pinMask);
-                pianolaPosition++;
-            }
-            // if we get to the end of the pianola
-            // stop running if we're not repeating
-            else if(pianolaStatus == REPEATING)
-            {
-                // if we want to repeat then set to the repeat from address
-                // this defaults to 0 so its the same as going to the start
-                // else if we've set it from a command, repeat from that address till heat death
-                pianolaPosition = pianolaRepeatAddr;
-            }
-            else if (pianolaRepeatFlag)
-            {
-                // we were running but want to start repeating
-                pianolaStatus = REPEATING;
-                pianolaPosition = pianolaRepeatAddr;
-                pianolaRepeatFlag = 0;
-            }
-            else // pianolaStatus was running and we should now stop
-            {   
-                pianolaPosition = 0;
-                pianolaStatus = READY;
-            }
-        }
+        pianolaManagerStep();
     }
 }
 
@@ -593,6 +605,9 @@ void stabilisePianolaClock(void)
         sleep_us(10000);
     }
 }
+#ifdef TIMINGBOX_HOST_TEST
+#define main firmware_main
+#endif
 void main(void)
 {
     // This is Core0 which handles basic setup of hardware and then runs an interrupt 
