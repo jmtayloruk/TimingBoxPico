@@ -205,9 +205,7 @@ void updateStatusLED(void)
 uint32_t getPianolaTime()
 {
     pio_sm_put_blocking(pioBlock, smPianolaClock, 0xF);
-    uint32_t t = 0xFFFFFF - pio_sm_get_blocking(pioBlock, smPianolaClock);
-    pio_sm_drain_tx_fifo(pioBlock, smPianolaClock);
-    return t;
+    return 0xFFFFFFu - pio_sm_get_blocking(pioBlock, smPianolaClock);
 }
 
 // Core 1 owns all output-SM control. Disabling alone would only pause the

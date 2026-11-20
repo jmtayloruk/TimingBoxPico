@@ -18,6 +18,7 @@ Or if theres a smarter way to initialise the clock to all ones.
 .wrap_target
 
 ;init the x register and flush the osr once were done using it as a temp scratch register
+reload:
 set x, 0b00000 ; set x to 0
 mov osr, ~x ; move inverse (all ones) to osr
 out x, 24 ; move back only 24 bits
@@ -31,12 +32,13 @@ wait1:
     jmp !x clr0
     jmp x-- wait1 [6]
 
-; push response to the rxfifo
+; consume one request before pushing its timestamp
 sendresp:
+    pull
     mov isr, x
     push noblock
-    jmp !x clr
-    jmp x-- wait1 [4]
+    jmp !x reload            ; skip the padding nop to keep the wrap tick at 10 cycles
+    jmp x-- wait1 [3]
 
 ;some extra labels to catch x == 0 prior to decrement
 clr0:

@@ -118,16 +118,38 @@ def pio_tests(binary):
         assert 32 <= elapsed <= 34, (
             f'Expected idle immediately after the minimum one-tick entry, got {elapsed} PIO cycles'
         )
+
     def clock_freshness():
-        p = Pio(ROOT / 'pianola24bitClock.pio'); p.tx.append(15)
-        p.until(lambda: len(p.rx) == 4)
-        p.rx.popleft()  # CPU reads one timestamp, then drains request FIFO.
-        p.tx.clear()
-        for _ in range(100): p.step()
-        request_cycle = p.cycles; p.tx.append(15)
-        p.until(lambda: bool(p.rx))
-        sampled_cycle, _ = p.rx.popleft()
-        assert sampled_cycle >= request_cycle, f'Clock returned sample from cycle {sampled_cycle} for request at cycle {request_cycle}: stale RX data'
+        p = Pio(ROOT / 'pianola24bitClock.pio')
+        for request in (1, 2):
+            request_cycle = p.cycles
+            p.tx.append(0xF)
+            # Delay the CPU read long enough to expose repeated responses.
+            for _ in range(100):
+                p.step()
+            assert len(p.rx) == 1, f'Request {request} produced {len(p.rx)} queued samples'
+            assert not p.tx, f'Clock did not consume request {request}'
+            sampled_cycle, _ = p.rx.popleft()
+            assert sampled_cycle >= request_cycle, (
+                f'Request {request} at cycle {request_cycle} returned a sample from cycle {sampled_cycle}'
+            )
+
+    def clock_tick_cycles():
+        for counter, expected in ((1, 0), (0, 0xFFFFFF)):
+            for requested in (False, True):
+                p = Pio(ROOT / 'pianola24bitClock.pio')
+                p.pc = p.labels['wait1']
+                p.reg['x'] = counter
+                if requested:
+                    p.tx.append(0xF)
+                p.step()
+                p.until(lambda: p.pc == p.labels['wait1'])
+                context = f'counter={counter}, request={requested}'
+                assert p.cycles == 10, f'{context}: tick took {p.cycles} cycles'
+                assert p.reg['x'] == expected, f'{context}: next counter was {p.reg["x"]:#x}'
+                samples = [sample for _, sample in p.rx]
+                assert samples == ([counter] if requested else []), f'{context}: got samples {samples}'
+
     def divider():
         import re
         source = (ROOT / 'picoTimingBoxFirmware.c').read_text()
@@ -141,6 +163,7 @@ def pio_tests(binary):
         ('functional', 'pio_adjacent_patterns', 'PIO / no inserted low between high entries', no_glitch),
         ('functional', 'pio_final_pattern', 'PIO / retain final output pattern', final_hold),
         ('functional', 'clock_sample_freshness', 'Clock PIO / fresh sample per request', clock_freshness),
+        ('functional', 'clock_tick_cycles', 'Clock PIO / ten-cycle ticks through wraparound', clock_tick_cycles),
         ('timing', 'pio_entry_spacing', 'Timing / one- and four-tick entry spacing', entry_spacing),
         ('timing', 'pio_repeat_spacing', 'Timing / entry spacing through the repeat boundary', lambda: entry_spacing(repeat=True)),
         ('timing', 'pio_final_duration', 'Timing / minimum-duration final entry reaches idle after one tick', final_duration),
