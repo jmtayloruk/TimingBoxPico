@@ -54,9 +54,9 @@ WARN [TIMING] pio_entry_spacing — Timing / one- and four-tick entry spacing
 
 Existing firmware bugs are deliberately ordinary failing tests, not expected
 failures which turn the suite green. Fixing them should turn their tests green.
-Intentional limitations, such as fixed output-source mappings and PIV-enable
-being a no-op, have explicit compatibility tests. If those features are
-implemented, update that documented contract and its tests together.
+Compatibility tests cover unsupported source IDs and PIV-enable being a no-op.
+Routing tests cover queued and held masks, clock, status and constant overrides,
+and the shared clock phase with a manually advanced microsecond timer.
 
 An inserted low between two high patterns and failure to retain the final pattern
 are functional failures: they change the output pattern. Extra elapsed time with
@@ -226,10 +226,12 @@ python3 tests/hardware_stress.py --list-ports
 Close the SPIM application/other serial clients, then choose the
 FTDI device. The script claims exclusive tty access where supported. This is a
 test of a device you can reprogram: it replaces and runs its pianola. The default
-pattern bit is 4, the onboard GP25 LED in the current Pico firmware. Other bits
-are low in the uploaded patterns. Disconnect attached equipment if its mapping
-is uncertain. The firmware/version and fixed-source readback are checked before
-running patterns; they do not prove physical wiring or identify a device uniquely.
+pattern uses bit 4. The script temporarily routes bit 4 to the Board LED (GP25)
+if the LED defaults to Pianola running, and restores that route during cleanup
+if the serial connection is healthy. Other bits are low in the patterns.
+Disconnect attached equipment if its mapping is uncertain. The firmware version
+and LED route are checked before running patterns. These checks cannot establish
+physical wiring or uniquely identify the device.
 
 Omit `--port` to see a numbered list of all `/dev/cu.usbserial*` ports and choose
 one interactively (even if only one is available). Enter `q` to cancel without
@@ -251,7 +253,7 @@ The automatic cases check:
 - Exact reply lengths and a short quiet interval to detect unsolicited bytes.
 - Clock advancement against broad host-time bounds. USB/OS latency prevents this
   being an absolute-frequency calibration; suspicious timing is a warning.
-- Fixed source readback for the chosen logical LED output.
+- Source readback for the chosen logical LED output, including temporary Board LED routing.
 - Back-to-back no-response uploads of 3, 32 and 256 entries, followed by run,
   stop and query commands. The protocol has no sequence readback: this checks
   subsequent replies and responsiveness, not complete upload contents.
@@ -327,8 +329,8 @@ final level visible through the question.
 5. A one-shot with one second OFF followed by a one-tick ON entry. The LED
    should remain ON for the rest of the observation and through the question.
 
-Watch the **onboard LED**, not the green/blue state indicator. Interactive checks
-require the current bit-4 onboard mapping. Their viewing windows total about
+Watch the **Board LED** for these checks. Interactive mode uses the temporary
+bit-4 Board LED mapping. Its viewing windows total about
 38 seconds, plus serial exchanges, preparation and answer time. 'n' records a functional human-observed failure, 's'
 records SKIP, and EOF records a failed observation. Human passes supplement,
 rather than upgrade, automated serial passes. They are useful for gross waveform/

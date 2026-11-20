@@ -25,6 +25,7 @@ class Peer:
         self.buffer = bytearray()
         self.now = 100
         self.closed = False
+        self.pin_sources = {4: bytes((25, 0)), 5: bytes((29, 0)), 6: bytes((29, 0))}
 
     def write(self, data, timeout):
         self.writes.append(bytes(data)); self.buffer.extend(data)
@@ -37,7 +38,9 @@ class Peer:
             elif op in (5,8):
                 self.now=(self.now+100)&hw.MASK;response=hw.u24(self.now)
             elif op==6: response=b'\x01'+hw.u24(self.now)
-            elif op==10: response=bytes((packet[1],0))
+            elif op==9:
+                self.pin_sources[packet[1]]=packet[2:4]; response=b''
+            elif op==10: response=self.pin_sources.get(packet[1],bytes((packet[1],0)))
             else: response=b''
             if self.mode=='silent': response=b''
             if self.mode=='extra' and response: response+=b'\xaa'
@@ -185,6 +188,9 @@ class RunnerTests(unittest.TestCase):
         self.assertTrue(report['serial_trace'])
         self.assertTrue(all(r['status'] in ('PASS','WARN') for r in report['results']))
         self.assertIn('Explicit low',report['cleanup'])
+        self.assertIn('Board LED route restored',report['cleanup'])
+        self.assertIn(bytes((9,4,4,0)),peer.writes)
+        self.assertEqual(peer.pin_sources[4],bytes((25,0)))
         self.assertNotIn('short_lead_schedule',[r['name'] for r in report['results']])
 
     def test_main_runs_optional_diagnostic_and_records_category(self):

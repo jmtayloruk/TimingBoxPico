@@ -118,6 +118,7 @@ class Box:
         self.trace = []
         self.latencies = []
         self.transactions = 0
+        self.board_led_restore = None
 
     def send(self, data):
         self.trace.append({'t': time.monotonic(), 'tx': data.hex()})
@@ -149,6 +150,12 @@ class Box:
 
     def version(self):
         return tuple(self.query(b'\xfd', 2))
+
+    def set_pin_source(self, pin, source):
+        self.send(bytes((9, pin)) + source)
+        actual = self.query(bytes((10, pin)), 2)
+        if actual != source:
+            raise TransportFailure(f'Output {pin}: expected source/inversion {tuple(source)}, got {tuple(actual)}')
 
     def stop(self):
         self.send(b'\x07')
@@ -277,10 +284,15 @@ def automated(box, report, args):
     report.test('clock_progress', 'clock progression over 100 ms; coarse host-time bounds', clock_progress)
 
     def source_check():
-        source, inverted = box.query(bytes((10, args.led_bit)), 2)
-        if (source, inverted) != (args.led_bit, 0):
-            raise TransportFailure(f'Chosen LED output {args.led_bit} reports source/inversion {(source,inverted)}, expected {(args.led_bit,0)}; this script requires the fixed Pico mapping')
-    report.test('led_mapping', 'validate chosen logical output readback before playback', source_check)
+        pin = args.led_bit
+        source = box.query(bytes((10, pin)), 2)
+        expected = bytes((pin, 0))
+        if pin == 4 and source == bytes((25, 0)):
+            box.board_led_restore = source
+            box.set_pin_source(pin, expected)
+        elif source != expected:
+            raise TransportFailure(f'Chosen LED output {pin} reports source/inversion {tuple(source)}, expected {tuple(expected)}')
+    report.test('led_mapping', 'check or configure the LED route before playback', source_check)
 
     def uploads():
         for count in (3, 32, 256):
@@ -330,7 +342,7 @@ def automated(box, report, args):
             elif action == 1:
                 source = box.query(bytes((10, args.led_bit)), 2)
                 if source != bytes((args.led_bit, 0)):
-                    raise Failure(f'Seed {args.seed}, event {iterations}: incorrect fixed-source reply {source.hex()}')
+                    raise Failure(f'Seed {args.seed}, event {iterations}: incorrect LED route reply {source.hex()}')
             elif action == 2:
                 box.run()
             elif action == 3:
@@ -526,7 +538,7 @@ def parser():
     ap.add_argument('--lead-ms', type=float, default=100, help='communications-check scheduling lead, ms (default 100)')
     ap.add_argument('--short-lead-ms', type=float, metavar='MS', help='opt-in short-lead timing diagnostic, e.g. 10; expired-target rejections are timing warnings')
     ap.add_argument('--seed', type=int, default=20261120, help='reproducible mixed-traffic seed')
-    ap.add_argument('--led-bit', type=int, default=4, choices=range(8), help='logical sequence LED bit (default 4 = GP25 in current Pico firmware)')
+    ap.add_argument('--led-bit', type=int, default=4, choices=range(8), help='logical sequence LED bit (default 4, temporarily routed to the Board LED)')
     ap.add_argument('--interactive', action='store_true', help='add optional human LED observations')
     ap.add_argument('--strict-timing', action='store_true', help='timing warnings also fail the exit status')
     ap.add_argument('--json', type=Path, help='write results, timings and full serial trace to this file')
@@ -579,7 +591,11 @@ def main(argv=None):
                 if report.broken:
                     box.stop();cleanup='Stop command sent; serial stream untrusted, output state unverified'
                 else:
-                    box.all_low();cleanup='Explicit low sequence and stop sent; output state not physically verified'
+                    box.all_low()
+                    cleanup='Explicit low sequence and stop sent; output state not physically verified'
+                    if box.board_led_restore is not None:
+                        box.set_pin_source(4, box.board_led_restore)
+                        cleanup += '; original Board LED route restored'
             except (Failure,OSError) as exc:
                 cleanup=f'Cleanup failed: {exc}; power-cycle/check outputs'
                 report.results.append(dict(name='cleanup',area='best-effort low/stop',category='FUNCTIONAL',status='FAIL',detail=cleanup))

@@ -11,7 +11,7 @@ from collections import deque
 MASK = 0xFFFFFFFF
 
 class Pio:
-    def __init__(self, path, out_count=24):
+    def __init__(self, path, out_count=26):
         # Ignore introductory C comments and the embedded C SDK initialiser.
         text = path.read_text().split('.program', 1)[1]
         self.code, self.labels = [], {}

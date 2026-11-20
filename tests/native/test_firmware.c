@@ -13,8 +13,11 @@ static void *poison_malloc(size_t n) { void *p=malloc(n); if(p) memset(p,0xA5,n)
 #include <math.h>
 #include "fixtures.h"
 #define CHECK(c,...) do { if(!(c)) { fprintf(stderr,__VA_ARGS__); fputc('\n',stderr); exit(1); } } while(0)
+static const uint32_t boardLedPin = 1u<<25;
+static const uint32_t ledPins = (1u<<25) | (1u<<26) | (1u<<27);
 static void setup(void) {
     queue_init(&commandQ,32,commandQDepth); queue_init(&responseQ,32,responseQDepth); queue_init(&dumpDebugQ,32,32);
+    resetPinSources();
     pianolaStatus=READY; context=0;
 }
 /* Host packets are passed through the actual UART receiver, then the actual
@@ -31,9 +34,9 @@ static void entry(unsigned address,unsigned mask,uint32_t duration) {
     SEND(1,address,mask,duration>>16,duration>>8,duration);
 }
 static uint32_t expected_mask(unsigned bits) {
-    /* Independent physical wiring expectation, not remapPinMask(). */
-    const unsigned positions[]={0,9,12,13,23};uint32_t result=0;
-    for(unsigned b=0;b<5;b++) if(bits&(1u<<b)) result|=1u<<positions[b];return result;
+    /* Default PIO wiring, before any per-pin override. */
+    const unsigned positions[]={0,9,12,13,23,25,24};uint32_t result=0;
+    for(unsigned b=0;b<count_of(positions);b++) if(bits&(1u<<b)) result|=1u<<positions[b];return result;
 }
 static void expect_next(unsigned bits,uint32_t duration,const char *where) {
     for(unsigned i=0;i<8 && fifo_level<2;i++) step();
@@ -53,7 +56,7 @@ static void test_masks_durations(void) {
     const uint32_t durations[]={0,1,4,255,256,65535,65536,0x7FFFFF,0xFFFFFF};
     for(unsigned b=0;b<256;b++) {
         uint32_t d=durations[b%count_of(durations)];entry(b,b,d);
-        CHECK((uint32_t)pianola[b]==d && (pianola[b]>>32)==expected_mask(b),"Entry %u: wrong mask/duration decoding",b);
+        CHECK((uint32_t)pianola[b]==d && (pianola[b]>>32)==b,"Entry %u: wrong mask/duration decoding",b);
     }
 }
 static void test_camera(void) {
@@ -67,9 +70,18 @@ static void test_piv(void) {
     SEND(13,0,1);SEND(13,0,0);SEND(0xFD);CHECK(tx_count==2,"PIV enable/disable must consume both parameters without a reply");
 }
 static void test_pin_sources(void) {
+    const unsigned defaults[]={0,1,2,3,25,29,29};
     for(unsigned p=0;p<256;p++) {
-        SEND(9,p,28,1);unsigned before=tx_count;SEND(10,p);
-        CHECK(tx_count==before+2 && tx[before]==(p<5?p:29) && tx[before+1]==0,"Pin %u: fixed-source readback is inconsistent",p);
+        SEND(9,p,27,1);unsigned before=tx_count;SEND(10,p);
+        CHECK(tx_count==before+2 && tx[before]==(p<count_of(defaults)?defaults[p]:29) && tx[before+1]==0,"Pin %u: default readback or unsupported-source handling is inconsistent",p);
+    }
+    for(unsigned p=0;p<count_of(defaults);p++) {
+        for(unsigned source=0;source<8;source++) {
+            unsigned inverted=source&1;
+            SEND(9,p,source,inverted);unsigned before=tx_count;SEND(10,p);
+            CHECK(tx_count==before+2 && tx[before]==source && tx[before+1]==inverted,
+                  "Pin %u: did not report configured source %u and inversion",p,source);
+        }
     }
 }
 static void test_time_arithmetic(void) {
@@ -194,7 +206,7 @@ static void finish_and_expect_ready(const char *where, unsigned last_mask) {
     CHECK(pianolaStatus==RUNNING || pianolaStatus==REPEATING,"%s: ready before active final entry completed",where);
     active=false;driver_pc=driver_wait_pc;step();
     CHECK(pianolaStatus==READY && pianolaPosition==0 && fifo_level==0,"%s: did not finish at READY",where);
-    CHECK(output_levels()==(expected_mask(last_mask)<<2),"%s: changed final pattern instead of natural completion",where);
+    CHECK(output_levels()==(expected_mask(last_mask&0xF)<<2),"%s: changed final pattern instead of natural completion",where);
     for(unsigned i=0;i<10;i++) step();
     CHECK(!fifo_level && pianolaStatus==READY,"%s: stopped sequence spontaneously repeated",where);
 }
@@ -287,15 +299,16 @@ static void test_debug_record(void) {
     CHECK(record[0]==2 && record[1]==6 && record[2]==6,"Debug record omitted response data: expected length,6,6; got %u,%u,%u",record[0],record[1],record[2]);
 }
 static void test_configuration(void) {
-    uint32_t mask=(1u<<2)|(1u<<11)|(1u<<14)|(1u<<15)|(1u<<25);
+    uint32_t mask=(1u<<2)|(1u<<11)|(1u<<14)|(1u<<15)|ledPins;
     // Execute the real startup, including its actual configuration arguments.
     // Stop before either infinite core loop starts; no startup copy lives here.
     trap_enabled=true;
     if(setjmp(trap)==0) firmware_main();
     trap_enabled=false;
     CHECK(!strcmp(trap_reason,"firmware startup reached core-1 launch"),"Startup failed before launching core 1: %s",trap_reason);
-    CHECK(output_base==2 && output_count==24,"PIO OUT mapping does not span all five outputs");
-    CHECK(gpio_directions==(mask|(1u<<26)|(1u<<27)) && gpio_functions==mask && !(gpio_levels&mask),"Initialisation drove/muxed unintended GPIOs or failed to initialise low");
+    CHECK(output_base==2 && output_count==26,"PIO OUT mapping does not span all seven outputs");
+    CHECK(gpio_directions==mask && gpio_functions==mask && !(gpio_levels&mask),"Initialisation drove/muxed unintended GPIOs or failed to initialise low");
+    CHECK(gpio_overridden==ledPins && !(gpio_forced_high&ledPins),"Startup did not drive all three configurable LEDs low");
 }
 static void test_live_mutation(void) {
     uint32_t seed=0x12345678;
@@ -442,7 +455,7 @@ static void test_full_wire_upload(void) {
     // Producer gets bursts of foreground iterations; consumer gets only one.
     // This fills the queues and exercises retention without a copied parser.
     for(unsigned i=0;i<1000;i++) {for(unsigned j=0;j<3;j++) service();step();}
-    for(unsigned i=0;i<256;i++) CHECK((uint32_t)pianola[i]==4+i && (pianola[i]>>32)==expected_mask(i),"Full wire upload corrupted entry %u",i);
+    for(unsigned i=0;i<256;i++) CHECK((uint32_t)pianola[i]==4+i && (pianola[i]>>32)==i,"Full wire upload corrupted entry %u",i);
     CHECK(rx_pos==rx_count && pianolaFinalPosition==255 && tx_count==2 && tx[0]==6 && tx[1]==6,"Full upload lost end marker or following reply");
 }
 static void test_debug_wire_order(void) {
@@ -452,10 +465,162 @@ static void test_debug_wire_order(void) {
     CHECK(!uart_context_errors,"Debug request caused UART access from core 1");
 }
 
-// Compare sequence-controlled GPIOs only; the separate status LEDs legitimately
-// change when RUNNING/READY changes and are not part of the frozen pattern.
+static uint32_t observed_gpio_levels(void) {
+    return (gpio_levels&~gpio_overridden)|(gpio_forced_high&gpio_overridden);
+}
+
+// Compare BNC levels independently of the configurable LED routes.
 static uint32_t output_levels(void) {
-    return gpio_levels & ((1u<<2)|(1u<<11)|(1u<<14)|(1u<<15)|(1u<<25));
+    return observed_gpio_levels() & ((1u<<2)|(1u<<11)|(1u<<14)|(1u<<15));
+}
+static void test_live_pin_routing(void) {
+    entry(0,1,20);entry(1,1,30);entry(2,0x82,40);SEND(2,2);run();
+    expect_next(1,20,"Active entry before reroute");
+    step();
+    SEND(9,0,1,0);
+    CHECK(output_levels()==(1u<<2) && fifo_level==2,"Remap interrupted the active entry or flushed the FIFO");
+    expect_next(1,30,"Queued entry retains original mapping");
+    expect_next(3,40,"Later entry routes bit 1 to both BNCs");
+
+    SEND(9,0,7,1);
+    CHECK(output_levels()==((1u<<2)|(1u<<11)),"Remap changed the final entry before it completed");
+    entry(2,0,1);
+    active=false;
+    driver_pc=driver_wait_pc;
+    step();
+    CHECK(pianolaStatus==READY && output_levels()==(1u<<11),
+          "Completion did not reroute the held snapshot with bit 7 inverted");
+    SEND(9,0,7,0);
+    CHECK(output_levels()==((1u<<2)|(1u<<11)),"Idle remap did not immediately use the held snapshot");
+}
+static void test_one_hz_routing(void) {
+    SEND(9,0,7,0);
+    entry(0,0x80,20);entry(1,0x81,30);SEND(2,1);run();
+    expect_next(1,20,"Bit 7 drives BNC before clock selection");
+
+    SEND(9,0,12,0);
+    unsigned before=tx_count;SEND(10,0);
+    CHECK(tx_count==before+2 && tx[before]==12 && tx[before+1]==0 && output_levels()==0,
+          "Clock selection did not report source 12 and immediately apply the low phase");
+    SEND(9,1,12,1);
+    CHECK(output_levels()==(1u<<11),"Inverted output did not share the clock's phase");
+    fake_time_us=499999;step();
+    CHECK(output_levels()==(1u<<11),"First clock edge arrived early");
+    fake_time_us=500000;step();
+    CHECK(output_levels()==(1u<<2),"Clock did not toggle both outputs at a half-second");
+    expect_next(1,30,"PIO still drives the routed bit behind the override");
+    fake_time_us=1000000;step();
+    CHECK(output_levels()==(1u<<11),"Clock missed its falling edge while playing");
+    SEND(9,0,7,0);
+    CHECK(gpio_overridden==(ledPins|(1u<<11)) && output_levels()==((1u<<2)|(1u<<11)),
+          "Returning to an unchanged pianola route did not immediately unmask the high level");
+
+    SEND(7);
+    fake_time_us=1500000;step();
+    CHECK(output_levels()==(1u<<2),"Clock stopped with the pianola");
+    fake_time_us=3250000;step();
+    CHECK(output_levels()==((1u<<2)|(1u<<11)),"Clock did not recover its absolute phase after a late poll");
+    SEND(0xFF);
+    before=tx_count;SEND(10,0);SEND(10,1);
+    CHECK(gpio_overridden==ledPins && !observed_gpio_levels() && tx_count==before+4 && tx[before]==0 && tx[before+2]==1,
+          "Hard reset did not clear overrides and restore default routes");
+}
+static void test_constant_pin_sources(void) {
+    const uint32_t bnc0 = 1u << 2;
+    const uint32_t bnc1 = 1u << 11;
+    entry(0,1,20);entry(1,2,30);SEND(2,1);run();
+    expect_next(1,20,"Active entry before constant override");
+
+    SEND(9,0,12,0);
+    CHECK(output_levels()==0,"Initial clock state did not override BNC 0");
+    SEND(9,0,28,0);SEND(9,1,29,0);
+    expect_next(2,30,"Pianola advances behind both constant overrides");
+    fake_time_us=1000000;step();
+    CHECK(output_levels()==bnc0,"The clock or the queued pianola mask changed a constant output");
+
+    SEND(9,0,28,1);SEND(9,1,29,1);
+    unsigned before=tx_count;SEND(10,0);SEND(10,1);
+    CHECK(output_levels()==bnc1 && tx_count==before+4 && tx[before]==28 && tx[before+1]==1 &&
+          tx[before+2]==29 && tx[before+3]==1,"Constant source readback or inversion is incorrect");
+
+    SEND(9,0,29,1);SEND(9,1,28,1);
+    CHECK(output_levels()==bnc0,"Inverted constants did not drive the opposite levels");
+    SEND(9,0,0,0);SEND(9,1,1,0);
+    CHECK(gpio_overridden==ledPins && output_levels()==bnc1,"Clearing constant overrides did not reveal the active pianola pattern");
+
+    SEND(9,0,28,0);SEND(9,1,29,0);SEND(0xFF);
+    CHECK(gpio_overridden==ledPins && !observed_gpio_levels(),"Hard reset left a custom constant override active");
+}
+static void test_pianola_status_sources(void) {
+    const uint32_t running = 1u << 2;
+    const uint32_t pending = 1u << 11;
+    const uint32_t invertedPending = 1u << 14;
+    entry(0,0,40);SEND(2,0);
+    SEND(9,0,25,0);SEND(9,1,26,0);SEND(9,2,26,1);
+    unsigned before=tx_count;SEND(10,0);SEND(10,1);SEND(10,2);
+    CHECK(tx_count==before+6 && tx[before]==25 && tx[before+1]==0 &&
+          tx[before+2]==26 && tx[before+3]==0 && tx[before+4]==26 && tx[before+5]==1,
+          "Status routing did not round-trip the source and inversion");
+    CHECK(output_levels()==invertedPending,"Idle Running and Pending levels are incorrect");
+
+    fake_time=100;SEND(6,0,0,200);
+    CHECK(output_levels()==pending,"Arming a start did not assert Pending only");
+    SEND(6,0,0,99);
+    CHECK(output_levels()==invertedPending,"Rejecting a fire time did not clear Pending");
+    SEND(6,0,0,200);
+    fake_time=200;step();
+    CHECK(output_levels()==(running|invertedPending),"Scheduled start did not transition from Pending to Running");
+    expect_next(0,40,"Scheduled status test entry");
+    step();
+    CHECK(output_levels()==(running|invertedPending),"Running cleared while the final entry was still active");
+    active=false;driver_pc=driver_wait_pc;step();
+    CHECK(output_levels()==invertedPending,"Running did not clear after the final entry completed");
+
+    SEND(4,1);run();
+    CHECK(output_levels()==(running|invertedPending),"Immediate start did not assert Running");
+    expect_next(0,40,"First pass before repeat");
+    step();
+    CHECK(pianolaStatus==REPEATING && output_levels()==(running|invertedPending),"Running did not stay high through repeat");
+    SEND(6,0,1,44);
+    CHECK(output_levels()==(running|pending),"Running and Pending did not coexist for a scheduled restart");
+    SEND(9,3,26,0);
+    CHECK(output_levels()==(running|pending|(1u<<15)),"Selecting Pending while armed did not drive its current level");
+
+    fake_time=300;step();
+    CHECK(output_levels()==(running|invertedPending),"Scheduled restart did not clear Pending while keeping Running high");
+    SEND(6,0,1,144);SEND(7);
+    CHECK(output_levels()==invertedPending,"Stopping with a restart armed did not clear both status signals");
+    SEND(0xFF);
+    CHECK(gpio_overridden==ledPins && !observed_gpio_levels(),"Hard reset did not restore default LED overrides");
+}
+static void test_led_routing(void) {
+    const uint32_t green=1u<<26;
+    const uint32_t blue=1u<<27;
+    entry(0,0,40);SEND(2,0);SEND(4,1);
+    fake_time=100;SEND(6,0,0,200);
+    CHECK(!observed_gpio_levels(),"Default LEDs lit while playback was pending");
+    fake_time=200;step();
+    CHECK(observed_gpio_levels()==boardLedPin,"Only the Board LED should light during playback");
+    expect_next(0,40,"First pass with default LED routes");
+    step();
+    CHECK(pianolaStatus==REPEATING && observed_gpio_levels()==boardLedPin,"Board LED did not stay on through repeat");
+    SEND(6,0,1,44);
+    CHECK(observed_gpio_levels()==boardLedPin,"An external LED lit when a restart was armed");
+    SEND(7);
+    CHECK(!observed_gpio_levels(),"Stopping did not turn off the Board LED");
+
+    SEND(9,5,0,0);SEND(9,6,1,0);
+    entry(0,1,40);entry(1,2,40);SEND(2,1);run();
+    CHECK(gpio_overridden==boardLedPin,"Selecting pianola sources did not release the external LEDs to PIO");
+    CHECK(consume_entry() && observed_gpio_levels()==(boardLedPin|blue|(1u<<2)),"Pianola bit 0 did not drive the blue LED and BNC together");
+    step();
+    CHECK(consume_entry() && observed_gpio_levels()==(boardLedPin|green|(1u<<11)),"Pianola bit 1 did not drive the green LED and BNC together");
+
+    SEND(6,0,1,44);SEND(0xFF);
+    unsigned before=tx_count;SEND(10,4);SEND(10,5);SEND(10,6);
+    CHECK(gpio_overridden==ledPins && !observed_gpio_levels() && tx_count==before+6 &&
+          tx[before]==25 && tx[before+1]==0 && tx[before+2]==29 && tx[before+3]==0 &&
+          tx[before+4]==29 && tx[before+5]==0,"Hard reset did not restore all three LED defaults at idle");
 }
 static void test_hardreset(void) {
     entry(0,31,1000);
@@ -470,7 +635,7 @@ static void test_hardreset(void) {
     run();
     expect_next(31,1000,"Entry active before hard reset");
     SEND(6,0,4,0);
-    CHECK(active && fifo_level==2 && output_levels()==(expected_mask(31)<<2) &&
+    CHECK(active && fifo_level==2 && observed_gpio_levels()==(expected_mask(31)<<2) &&
           pianolaFirePending && pianolaFireTime==1024,"Hard-reset test did not establish active, queued and scheduled work");
 
     unsigned before=tx_count;
@@ -514,19 +679,21 @@ static void test_hardreset(void) {
           "Run after hard reset replayed or repeated old entries");
 }
 static void test_stop_freezes_entry_zero(void) {
+    SEND(9,4,4,0);
     entry(0,17,0xFFFFFF);entry(1,2,1000);entry(2,4,1000);SEND(2,2);run();
     expect_next(17,0xFFFFFF,"Entry-zero start");step();expect_next(2,1000,"Different active pattern");step();
     CHECK(fifo_level==2,"Expected queued successor before stop");
     SEND(7);
     uint32_t expected=expected_mask(17)<<2;
-    CHECK(output_levels()==expected,"Stop must apply nonzero entry-zero pattern, expected GPIO=0x%x got 0x%x",expected,gpio_levels);
+    CHECK(observed_gpio_levels()==expected,"Stop must apply nonzero entry-zero pattern, expected GPIO=0x%x got 0x%x",expected,gpio_levels);
     CHECK(!active && !sm_enabled[0] && !fifo_level,"Stop retained active/queued work or left output SM enabled");
     CHECK(pianolaPosition==0 && pianolaStatus==READY && !pianolaFirePending && !pianolaRepeatFlag,"Stop did not rewind/cancel pending/repeat state");
     for(unsigned i=0;i<100;i++) {fake_time+=100;step();CHECK(!consume_entry(),"Stopped driver consumed a new entry");}
-    CHECK(output_levels()==expected,"Stopped entry-zero pattern was not held indefinitely");
+    CHECK(observed_gpio_levels()==expected,"Stopped entry-zero pattern was not held indefinitely");
     CHECK(!clock_control_changes && sm_enabled[1],"Stop modified the independent clock state machine");
 }
 static void test_stop_inflight_matrix(void) {
+    SEND(9,4,4,0);
     const unsigned masks[]={0,1,16,31};offsetPinDriver=3;
     // PCs cover status polling, each PULL/OUT boundary, countdown and pin-clear.
     // Odd FIFO levels represent a duration already pulled with mask still queued.
@@ -538,7 +705,7 @@ static void test_stop_inflight_matrix(void) {
         unsigned controls_before=control_count;SEND(7);
         CHECK(!sm_enabled[0] && !active && !fifo_level && !driver_delay,"Stop left in-flight state at PC=%u FIFO=%u",pc,words);
         CHECK(driver_pc==offsetPinDriver+pinDriver_wrap_target,"Stop failed to reposition PC from %u",pc);
-        CHECK(output_levels()==(expected_mask(masks[m])<<2),"Stop wrong entry-zero pattern for mask %u, PC %u, FIFO %u",masks[m],pc,words);
+        CHECK(observed_gpio_levels()==(expected_mask(masks[m])<<2),"Stop wrong entry-zero pattern for mask %u, PC %u, FIFO %u",masks[m],pc,words);
         CHECK(controls[controls_before].op=='E' && !controls[controls_before].value && controls[controls_before+1].op=='C' && controls[controls_before+2].op=='R',"Cancellation must disable, clear, restart in order");
     }
     CHECK(!clock_control_changes,"Cancellation matrix disturbed clock SM");
@@ -584,23 +751,25 @@ static void test_rejected_restart_preserves_playback(void) {
     expect_next(4,16,"Active sequence continues after pending restart is rejected");
 }
 static void test_stop_then_start(void) {
+    SEND(9,4,4,0);
     entry(0,16,4);entry(1,1,8);SEND(2,1);
     for(unsigned cycle=0;cycle<50;cycle++) {
         run();expect_next(16,4,"Repeated start");step();SEND(7);
-        CHECK(!sm_enabled[0] && output_levels()==(1u<<25),"Repeated stop failed to freeze LED-high entry zero");
+        CHECK(!sm_enabled[0] && observed_gpio_levels()==boardLedPin,"Repeated stop failed to freeze LED-high entry zero");
     }
 }
 static void test_completion_not_fifo_empty(void) {
     entry(0,1,1000);SEND(2,0);run();expect_next(1,1000,"Final entry in flight");step();
-    CHECK(pianolaStatus==RUNNING,"FIFO consumption was incorrectly treated as final-entry completion");
+    CHECK(pianolaStatus==RUNNING && (observed_gpio_levels()&boardLedPin),"FIFO consumption was incorrectly treated as final-entry completion");
     active=false;driver_pc=driver_wait_pc;step();
-    CHECK(pianolaStatus==READY,"Finished final entry did not transition to READY at the wait loop");
+    CHECK(pianolaStatus==READY && !(observed_gpio_levels()&boardLedPin),"Finished final entry did not transition to READY at the wait loop");
 }
 static void test_stop_after_ready(void) {
+    SEND(9,4,4,0);
     entry(0,16,4);entry(1,1,8);SEND(2,1);run();
     expect_next(16,4,"Final-state setup 0");expect_next(1,8,"Final-state setup 1");
     active=false;driver_pc=driver_wait_pc;step();CHECK(pianolaStatus==READY,"Expected ready state");
-    SEND(7);CHECK(output_levels()==(1u<<25) && !sm_enabled[0],"Stop while already ready did not apply entry-zero pattern");
+    SEND(7);CHECK(observed_gpio_levels()==boardLedPin && !sm_enabled[0],"Stop while already ready did not apply entry-zero pattern");
 }
 
 typedef struct {const char *name,*area;void (*fn)(void);} test;
@@ -627,7 +796,12 @@ static const test tests[]={
  {"mask_duration_boundaries","Protocol / all masks, addresses and duration boundaries",test_masks_durations},
  {"camera_packet_indices","Protocol / clock framing and invalid indices",test_camera},
  {"piv_network_order","Protocol / PIV decoding and enable no-op",test_piv},
- {"fixed_source_readback","Protocol / documented fixed-source limitation",test_pin_sources},
+ {"pin_source_readback","Protocol / default, configured and unsupported sources",test_pin_sources},
+ {"live_pin_routing","Playback / remap queued and held patterns at the correct boundary",test_live_pin_routing},
+ {"one_hz_routing","Outputs / shared timer, inversion and immediate override",test_one_hz_routing},
+ {"constant_pin_sources","Outputs / immediate On and Off overrides, inversion and release",test_constant_pin_sources},
+ {"pianola_status_sources","Outputs / Running and Pending through scheduling, repeating and stop",test_pianola_status_sources},
+ {"led_routing","Outputs / Board LED running, external LEDs off and remappable",test_led_routing},
  {"time_wrap_properties","Scheduling / 20,000 seeded modular-clock cases",test_time_arithmetic},
  {"current_time_reply","Protocol / sampled time reply",test_reply_time},
  {"scheduled_wrap_start","Scheduling / normal lead time across wrap",test_scheduled},

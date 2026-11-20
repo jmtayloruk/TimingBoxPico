@@ -28,18 +28,36 @@ In the pio files I annotate each line in plain English. There is a useful Pico b
 
 ## Output mapping
 
-The mappings are currently fixed. SET_PinSource does not change them.
+Each output can select any of the eight pianola bits, the shared 1 Hz clock,
+Pianola running, Pianola pending, constant On, or constant Off. Outputs can
+also invert their selected source. The initial routing is:
 
-| Pianola bit / output index | GPIO | Output |
-|---|---|---|
-| 0 | 2 | BNC output 0 |
-| 1 | 11 | BNC output 1 |
-| 2 | 14 | BNC output 2 |
-| 3 | 15 | BNC output 3 |
-| 4 | 25 | Onboard LED |
+| Output index | GPIO | Output | Default source |
+|---|---|---|---|
+| 0 | 2 | BNC output 0 | Pianola bit 0 |
+| 1 | 11 | BNC output 1 | Pianola bit 1 |
+| 2 | 14 | BNC output 2 | Pianola bit 2 |
+| 3 | 15 | BNC output 3 | Pianola bit 3 |
+| 4 | 25 | Board LED | Pianola running |
+| 5 | 27 | External blue LED | Off |
+| 6 | 26 | External green LED | Off |
 
-Bits 5-7 are ignored. The green/blue status indicator on GPIOs 26/27 is separate
-from the onboard LED driven by bit 4.
+The external LED's red channel is the hard-wired power indicator. The 1 Hz
+clock has a 500 ms half-period and runs independently of pianola playback.
+Selecting a clock, status or constant source
+applies its current level immediately. Selecting the pin's previous pianola
+source restores its current PIO level immediately.
+
+Pianola running stays asserted through repeats and falls at stop or after the
+last entry finishes. Pianola pending is asserted while a future start is armed.
+Both status sources can be high during playback when a restart is scheduled.
+The playback manager updates these signals in software.
+
+Changing which pianola bit drives a pin, or changing its pianola inversion,
+affects entries queued after the command. The active entry and any entry already
+queued retain their previous GPIO masks. Once playback is idle, a changed route
+is applied to the held logical pattern, including when the sequence finishes
+before an entry uses the new route.
 
 ## Timing model and known timebase mismatch
 
@@ -136,13 +154,19 @@ Call: CMD = 1 byte. Response: current pianola time = 3 bytes.
 
 ### SET_PinSource => 0x09
 
-In the XMOS protocol this selects a logical source bit for an output, with optional inversion; it does not set GPIO input/output directions. The Pico consumes the packet but currently ignores it. Its fixed mapping is reported by GET_PinSource.
+Selects a source for output indices 0–6. Source IDs 0–7 are pianola bits and
+source 12 is the 1 Hz clock. Sources 25 and 26 are Pianola running and Pianola
+pending. Sources 28 and 29 are constant On and Off. The low bit of the inversion
+flag controls polarity. Unsupported output or source indices leave the routing
+unchanged.
 
 Call: CMD, output index, source bit index, inversion flag = 4 bytes. Response: none.
 
 ### GET_PinSource => 0xA
 
-Gets the reported configuration for the queried output. The Pico reports output indices 0-4 mapped to the same-numbered pianola bit, with inversion 0. Other indices report source 29 (OFF), inversion 0. This does not implement configurable constant-OFF routing on the existing outputs.
+Returns the configured source and inversion immediately, including when a
+previously queued pianola entry still uses the old route. Output indices above 6
+report source 29 with inversion 0.
 
 Call: CMD, output index = 2 bytes. Response: source bit index, inversion flag = 2 bytes.
 
@@ -182,22 +206,15 @@ Call: CMD = 1 byte. Response: 1024 bytes.
 
 Cancels active and queued playback, drives all sequence outputs low, and clears
 the stored sequence, scheduled start, repeat settings, and camera-clock and PIV
-settings. Send one opcode byte. The command sends no reply. This is an in-place
-reset: the independent clock and UART keep running, and the CPU does not reboot.
+settings. It also restores the default LED and BNC mappings.
+Send one opcode byte. The command sends no reply. This is an in-place reset:
+the independent clock and UART keep running, and the CPU does not reboot.
 It does not flush the UART command/response queues or debug log.
 
 # To Do
 
-A short list of features present on other timing boxes that haven't been implemented. Basic fixed-mapping pianola playback works without them, but workflows using those XMOS features need support here.
-
-1. I never actually implemented the pin remapping function. As such, the various drop-down menues on the electronics setup do nothing for remapping or inverting the BNC's.
-2. Related to number 1 but in the spim-interface, I had intended to implement by own timing box type (and in fact there is a branch for this) that would present the correct output list in the electronics set up etc. This isn't a massive job - I just ran out of time.
-
-Update to item 2: the current host code now includes `kTimingBoxPico` and Pico
-output names; that part of the historical integration note has been addressed.
-The source selection/inversion controls still have no effect on this firmware.
-Other missing features include configurable camera clocks, the 1 Hz source,
-constant ON/OFF routing, exposure/external input routing and PIV execution.
+XMOS features still to implement include configurable camera clocks,
+exposure/external input routing and PIV execution.
 
 Ordinary live sequence edits are not atomic: already queued entries may use the
 old data. Program while stopped when consistent replacement matters. UART

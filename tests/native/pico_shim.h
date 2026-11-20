@@ -17,16 +17,21 @@ typedef unsigned uint;
 #define UART0_IRQ 0
 #define UART_PARITY_NONE 0
 #define GPIO_FUNC_UART 2
+#define GPIO_OVERRIDE_NORMAL 0
+#define GPIO_OVERRIDE_LOW 2
+#define GPIO_OVERRIDE_HIGH 3
 #define pio0 0
 #define uart0 0
 typedef int PIO;
 typedef struct { unsigned size, depth, read, level; unsigned char data[32][32]; } queue_t;
 typedef struct { unsigned base, count, set_count, div_int, div_frac; } pio_sm_config;
 static uint32_t fake_time, fifo[4], submitted[20000];
+static uint64_t fake_time_us;
 static unsigned fifo_level, submitted_count, violations, dropped, context;
 static unsigned uart_context_errors, block_on_empty, tx_count, rx_pos, rx_count;
 static unsigned char rx[8192], tx[16384];
-static uint32_t gpio_levels, gpio_directions, gpio_functions, output_base=2, output_count=24;
+static uint32_t gpio_levels, gpio_directions, gpio_functions, output_base=2, output_count=26;
+static uint32_t gpio_overridden, gpio_forced_high;
 static void fault(const char *reason);
 static bool active;
 static bool sm_enabled[2] = {true, true};
@@ -138,6 +143,14 @@ static bool consume_entry(void) {
     memmove(fifo,fifo+2,(fifo_level-2)*sizeof(*fifo)); fifo_level-=2; return true;
 }
 static void gpio_put(unsigned pin,bool v) { if(v) gpio_levels|=1u<<pin; else gpio_levels&=~(1u<<pin); }
+static void gpio_set_outover(unsigned pin,unsigned value) {
+    uint32_t bit=1u<<pin;
+    if(value==GPIO_OVERRIDE_NORMAL) { gpio_overridden&=~bit; return; }
+    if(value!=GPIO_OVERRIDE_LOW && value!=GPIO_OVERRIDE_HIGH) fault("Unexpected GPIO output override");
+    gpio_overridden|=bit;
+    if(value==GPIO_OVERRIDE_HIGH) gpio_forced_high|=bit; else gpio_forced_high&=~bit;
+}
+static uint64_t time_us_64(void) { return fake_time_us; }
 static void gpio_init(unsigned pin) { (void)pin; }
 static void gpio_set_dir(unsigned pin,bool v) { if(v) gpio_directions|=1u<<pin; else gpio_directions&=~(1u<<pin); }
 static void gpio_set_function(unsigned pin,unsigned f) { if(f!=GPIO_FUNC_UART) gpio_functions|=1u<<pin; }

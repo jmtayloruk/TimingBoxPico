@@ -58,12 +58,6 @@ noticed when designing the PCB layout so there's some less than elegant code to 
 #define OUTPUT_3_PIN 15
 #define IRQ_PIANOLACORE 46
 
-// GPIO pin index used for each output pin as indexed in GET_PinSource.
-// (n.b. currently the source for each pin is hard-mapped to the equivalent pianola bit)
-static const uint pianolaOutputPins[] = {
-    OUTPUT_0_PIN, OUTPUT_1_PIN, OUTPUT_2_PIN, OUTPUT_3_PIN, ONBOARD_LED_PIN
-};
-
 // ===============================================================================
 // Set up some pianola attributes
 //================================================================================
@@ -122,9 +116,43 @@ enum STATUS pianolaStatus = INIT;
 int pianolaFirmwareVersion = 6;
 int pianolaFirmwareEarliestVersion = 6;
 
-// XMOS protocol source index for constant low
-// We report this back in response to a GET_PinSource command for a pin we don't implement.
+#define PIANOLA_SOURCE_COUNT 8
+#define PIN_SOURCE_1HZ 12
+#define PIN_SOURCE_PIANOLA_RUNNING 25
+#define PIN_SOURCE_PIANOLA_PENDING 26
+#define PIN_SOURCE_ON 28
 #define PIN_SOURCE_OFF 29
+#define ONE_HZ_HALF_PERIOD_US 500000u
+
+// Indexed by pin number in SET_PinSource and GET_PinSource.
+static const struct {
+    uint gpio;
+    uint8_t defaultOverride;
+} pianolaOutputs[] = {
+    {OUTPUT_0_PIN, 0},
+    {OUTPUT_1_PIN, 0},
+    {OUTPUT_2_PIN, 0},
+    {OUTPUT_3_PIN, 0},
+    {ONBOARD_LED_PIN, PIN_SOURCE_PIANOLA_RUNNING},
+    {STATUS_LED_BLUE, PIN_SOURCE_OFF},
+    {STATUS_LED_GREEN, PIN_SOURCE_OFF},
+};
+
+// Core 1 owns routing. The PIO mapping stays current behind an override.
+static uint8_t pianolaSources[count_of(pianolaOutputs)];
+static uint32_t pianolaGpioMasks[2][16];
+static uint32_t pianolaInversionMask;
+typedef struct {
+    uint8_t source; // Zero means the pin is using its pianola route.
+    bool inverted;
+} PinOverride;
+static PinOverride pinOverrides[count_of(pianolaOutputs)];
+static uint32_t clockOutputPins;
+static uint64_t nextClockEdgeUs;
+static bool clockHigh;
+// Snapshot of the last submitted mask, which becomes the held pattern at idle.
+static uint8_t lastPianolaMask;
+static bool pianolaRoutingDirty;
 
 // piv params
 uint8_t pivIdx;
@@ -173,34 +201,96 @@ enum CMD_SET
 // Helper Functions that need to be declared before the parsers
 //================================================================================
 
-void updateStatusLED(void)
-{
-    if (pianolaFirePending)
-    {
-        gpio_put(STATUS_LED_GREEN, false);
-        gpio_put(STATUS_LED_BLUE, true);
-    }
-    else if (pianolaStatus == RUNNING)
-    {
-        gpio_put(STATUS_LED_GREEN, true);
-        gpio_put(STATUS_LED_BLUE, false);
-    }
-    else if (pianolaStatus == PANIC | pianolaStatus == RESET)
-    {
-        gpio_put(STATUS_LED_GREEN, true);
-        gpio_put(STATUS_LED_BLUE, true);
-    }
-    else
-    {
-        gpio_put(STATUS_LED_GREEN, false);
-        gpio_put(STATUS_LED_BLUE, false); 
-    }
-}
-
 uint32_t getPianolaTime()
 {
     pio_sm_put_blocking(pioBlock, smPianolaClock, 0xF);
     return 0xFFFFFFu - pio_sm_get_blocking(pioBlock, smPianolaClock);
+}
+
+static void setPianolaBitOutput(uint source, uint32_t outputMask, bool enabled)
+{
+    // Two four-bit lookup tables keep both per-entry and per-command work small.
+    uint32_t *masks = pianolaGpioMasks[source / 4];
+    uint sourceBit = 1u << (source % 4);
+    for (uint i = 0; i < count_of(pianolaGpioMasks[0]); i++)
+    {
+        if (i & sourceBit)
+            masks[i] = enabled ? masks[i] | outputMask : masks[i] & ~outputMask;
+    }
+}
+
+static uint32_t routePianolaMask(uint8_t mask)
+{
+    return (pianolaGpioMasks[0][mask & 0x0f] | pianolaGpioMasks[1][mask >> 4]) ^ pianolaInversionMask;
+}
+
+static bool pianolaIsRunning(void)
+{
+    return pianolaStatus == RUNNING || pianolaStatus == REPEATING;
+}
+
+static void drivePinOverride(uint pin)
+{
+    PinOverride route = pinOverrides[pin];
+    bool high;
+    switch (route.source)
+    {
+        case PIN_SOURCE_1HZ:             high = clockHigh; break;
+        case PIN_SOURCE_PIANOLA_RUNNING: high = pianolaIsRunning(); break;
+        case PIN_SOURCE_PIANOLA_PENDING: high = pianolaFirePending; break;
+        case PIN_SOURCE_ON:              high = true; break;
+        default:                         high = false; break;
+    }
+    gpio_set_outover(pianolaOutputs[pin].gpio, high != route.inverted ? GPIO_OVERRIDE_HIGH : GPIO_OVERRIDE_LOW);
+}
+
+static void resetPinSources(void)
+{
+    memset(pianolaGpioMasks, 0, sizeof(pianolaGpioMasks));
+    for (uint pin = 0; pin < count_of(pianolaOutputs); pin++)
+    {
+        uint gpio = pianolaOutputs[pin].gpio;
+        if (!pianolaOutputs[pin].defaultOverride && pinOverrides[pin].source)
+            gpio_set_outover(gpio, GPIO_OVERRIDE_NORMAL);
+        pinOverrides[pin] = (PinOverride){.source = pianolaOutputs[pin].defaultOverride};
+        if (pinOverrides[pin].source)
+            drivePinOverride(pin);
+        pianolaSources[pin] = pin;
+        setPianolaBitOutput(pin, 1u << (gpio - OUTPUT_0_PIN), true);
+    }
+    pianolaInversionMask = 0;
+    clockOutputPins = 0;
+    lastPianolaMask = 0;
+    pianolaRoutingDirty = false;
+}
+
+static void updatePianolaStatusOutputs(void)
+{
+    for (uint pin = 0; pin < count_of(pianolaOutputs); pin++)
+    {
+        uint source = pinOverrides[pin].source;
+        if (source == PIN_SOURCE_PIANOLA_RUNNING || source == PIN_SOURCE_PIANOLA_PENDING)
+            drivePinOverride(pin);
+    }
+}
+
+static void updateOneHzClock(void)
+{
+    if (!clockOutputPins)
+        return;
+    uint64_t now = time_us_64();
+    if (now < nextClockEdgeUs)
+        return;
+
+    // Derive phase from elapsed time so a late poll does not shift later edges.
+    uint64_t halfPeriods = now / ONE_HZ_HALF_PERIOD_US;
+    nextClockEdgeUs = (halfPeriods + 1) * ONE_HZ_HALF_PERIOD_US;
+    clockHigh = (halfPeriods & 1u) != 0;
+    for (uint pin = 0; pin < count_of(pianolaOutputs); pin++)
+    {
+        if (clockOutputPins & (1u << pin))
+            drivePinOverride(pin);
+    }
 }
 
 // Core 1 owns all output-SM control. Disabling alone would only pause the
@@ -224,7 +314,9 @@ static void queuePianolaEntry(uint8_t position)
     // adds one tick, so four requested ticks are encoded as three.
     // Encode zero as zero to retain the one-tick minimum without underflow.
     pio_sm_put(pioBlock, smPinDriver, duration ? duration - 1 : 0);
-    pio_sm_put(pioBlock, smPinDriver, (uint32_t)(entry >> 32));
+    lastPianolaMask = (uint8_t)(entry >> 32);
+    pio_sm_put(pioBlock, smPinDriver, routePianolaMask(lastPianolaMask));
+    pianolaRoutingDirty = false;
 }
 
 static void startPianola(void)
@@ -249,6 +341,68 @@ static void applyHaltedPinDriverMask(uint32_t pinMask)
                              pio_encode_jmp(offsetPinDriver + pinDriver_wrap_target));
 }
 
+static void refreshIdlePinRouting(void)
+{
+    if (pianolaRoutingDirty)
+    {
+        pio_sm_set_enabled(pioBlock, smPinDriver, false);
+        applyHaltedPinDriverMask(routePianolaMask(lastPianolaMask));
+        pianolaRoutingDirty = false;
+    }
+}
+
+static void setPinSource(uint pin, uint source, bool inverted)
+{
+    if (pin >= count_of(pianolaOutputs) ||
+        (source >= PIANOLA_SOURCE_COUNT && source != PIN_SOURCE_1HZ &&
+         source != PIN_SOURCE_PIANOLA_RUNNING && source != PIN_SOURCE_PIANOLA_PENDING &&
+         source != PIN_SOURCE_ON && source != PIN_SOURCE_OFF))
+        return;
+
+    uint gpio = pianolaOutputs[pin].gpio;
+    uint32_t pinMask = 1u << pin;
+    if (source >= PIANOLA_SOURCE_COUNT)
+    {
+        pinOverrides[pin] = (PinOverride){source, inverted};
+        if (source == PIN_SOURCE_1HZ)
+        {
+            clockOutputPins |= pinMask;
+            updateOneHzClock();
+        }
+        else
+        {
+            clockOutputPins &= ~pinMask;
+        }
+        drivePinOverride(pin);
+        return;
+    }
+
+    uint32_t outputMask = 1u << (gpio - OUTPUT_0_PIN);
+    if (pianolaSources[pin] != source)
+    {
+        setPianolaBitOutput(pianolaSources[pin], outputMask, false);
+        setPianolaBitOutput(source, outputMask, true);
+        pianolaSources[pin] = source;
+        pianolaRoutingDirty = true;
+    }
+    if (((pianolaInversionMask & outputMask) != 0) != inverted)
+    {
+        pianolaInversionMask ^= outputMask;
+        pianolaRoutingDirty = true;
+    }
+
+    // The FIFO keeps masks already submitted by the old routing.
+    if (!pianolaIsRunning())
+        refreshIdlePinRouting();
+
+    if (pinOverrides[pin].source)
+    {
+        clockOutputPins &= ~pinMask;
+        pinOverrides[pin] = (PinOverride){0};
+        gpio_set_outover(gpio, GPIO_OVERRIDE_NORMAL);
+    }
+}
+
 static void stopPianola(void)
 {
     cancelPinDriver();
@@ -258,7 +412,10 @@ static void stopPianola(void)
     pianolaFirePending = false;
     // Intentional XMOS difference: rewind AND apply the currently programmed
     // entry-zero pattern, ignoring its duration.
-    applyHaltedPinDriverMask((uint32_t)(pianola[0] >> 32));
+    lastPianolaMask = (uint8_t)(pianola[0] >> 32);
+    applyHaltedPinDriverMask(routePianolaMask(lastPianolaMask));
+    pianolaRoutingDirty = false;
+    updatePianolaStatusOutputs();
 }
 
 static void hardResetPianola(void)
@@ -283,6 +440,7 @@ static void hardResetPianola(void)
     pivCameraExposure = 0;
     pivCameraMonitorIdx = 0;
     pianolaStatus = INIT;
+    resetPinSources();
 }
 
 int isTimeInFuture(uint32_t currentTime, uint32_t proposedTime)
@@ -356,17 +514,6 @@ static uint32_t read_be32(const unsigned char *p)
          | (uint32_t)p[3];
 }
 
-uint32_t remapPinMask(unsigned char pianolaMask)
-{
-    // PIO output bits are relative to the first BNC GPIO.
-    uint32_t pinMask = 0;
-    for (uint bit = 0; bit < count_of(pianolaOutputPins); bit++)
-    {
-        pinMask |= ((pianolaMask >> bit) & 0x1) << (pianolaOutputPins[bit] - OUTPUT_0_PIN);
-    }
-    return pinMask;
-}
-
 void CommandParser(unsigned char *ptrDataReceived, unsigned char *ptrDataResponse)
 {
     // Large function that implements the parsing of each opcode that we could be sent, and acting on that command
@@ -376,7 +523,7 @@ void CommandParser(unsigned char *ptrDataReceived, unsigned char *ptrDataRespons
     {
         case SET_Pianola:
             uint32_t pianolaSetAddress = ptrDataReceived[1];
-            uint32_t pianolaPinMask = remapPinMask(ptrDataReceived[2]);
+            uint32_t pianolaPinMask = ptrDataReceived[2];
             uint32_t pianolaDuration = ptrDataReceived[3] << 16 | ptrDataReceived[4] << 8 | ptrDataReceived[5] & 0xFF;
             uint64_t pianolaEntry = 0;
             pianolaEntry += pianolaPinMask;
@@ -402,6 +549,7 @@ void CommandParser(unsigned char *ptrDataReceived, unsigned char *ptrDataRespons
             bytesToRespond = 3;
             startPianola();
             pianolaTime = getPianolaTime();
+            updatePianolaStatusOutputs();
             ptrDataResponse[1] = (pianolaTime >> 16) & 0xFF;
             ptrDataResponse[2] = (pianolaTime >> 8) & 0xFF;
             ptrDataResponse[3] = pianolaTime & 0xFF;
@@ -415,6 +563,7 @@ void CommandParser(unsigned char *ptrDataReceived, unsigned char *ptrDataRespons
             // A rejected request also supersedes any previously armed start.
             pianolaFirePending = isTimeInFuture(pianolaTime, proposedFireTime);
             pianolaFireTime = proposedFireTime;
+            updatePianolaStatusOutputs();
 
             ptrDataResponse[1] = pianolaFirePending;
             ptrDataResponse[2] = (pianolaTime >> 16) & 0xFF;
@@ -435,18 +584,31 @@ void CommandParser(unsigned char *ptrDataReceived, unsigned char *ptrDataRespons
             break;
 
         case SET_PinSource:
-            // Accept the XMOS packet, but do not actually do anything with it.
-            // The Pico output sources are fixed, and a subsequent call to GET_PinSource
-            // will just return our fixed mapping
+            setPinSource(ptrDataReceived[1], ptrDataReceived[2], (ptrDataReceived[3] & 1u) != 0);
             break;
 
         case GET_PinSource:
-            // If we are being queried about a pin that is supported by the Pico,
-            // report that it is mapped to that numerical pin source (which is one of the pianola bits)
+        {
+            uint pin = ptrDataReceived[1];
             bytesToRespond = 2;
-            ptrDataResponse[1] = ptrDataReceived[1] < count_of(pianolaOutputPins) ? ptrDataReceived[1] : PIN_SOURCE_OFF;
+            ptrDataResponse[1] = PIN_SOURCE_OFF;
             ptrDataResponse[2] = 0;
+            if (pin < count_of(pianolaOutputs))
+            {
+                if (pinOverrides[pin].source)
+                {
+                    ptrDataResponse[1] = pinOverrides[pin].source;
+                    ptrDataResponse[2] = pinOverrides[pin].inverted;
+                }
+                else
+                {
+                    uint32_t outputMask = 1u << (pianolaOutputs[pin].gpio - OUTPUT_0_PIN);
+                    ptrDataResponse[1] = pianolaSources[pin];
+                    ptrDataResponse[2] = (pianolaInversionMask & outputMask) != 0;
+                }
+            }
             break;
+        }
 
         case SET_CameraClk:
             int clockIdx = ptrDataReceived[1];
@@ -586,13 +748,13 @@ void core0Step(void)
 // Keep all playback decisions here; the test shim substitutes peripherals only.
 void pianolaManagerStep(void)
 {
-    updateStatusLED();
     pianolaTime = getPianolaTime();
     // Fire on the target tick or on the next poll if the target was missed.
     if (pianolaFirePending && !isTimeInFuture(pianolaTime, pianolaFireTime))
     {
         // Cancellation happens at firing, not when a future start is armed.
         startPianola();
+        updatePianolaStatusOutputs();
     }
 
     // Never block playback on a full response queue or lose a pending reply.
@@ -613,7 +775,7 @@ void pianolaManagerStep(void)
         }
     }
     //if theres an instruction to execute / we're currently running
-    if ((pianolaStatus == RUNNING | pianolaStatus == REPEATING) && pio_sm_is_tx_fifo_empty(pioBlock, smPinDriver))
+    if (pianolaIsRunning() && pio_sm_is_tx_fifo_empty(pioBlock, smPinDriver))
     {
         if (pianolaPosition <= pianolaFinalPosition)
         {
@@ -636,8 +798,11 @@ void pianolaManagerStep(void)
             // once the final entry has returned to the driver's wait loop.
             pianolaPosition = 0;
             pianolaStatus = READY;
+            refreshIdlePinRouting();
+            updatePianolaStatusOutputs();
         }
     }
+    updateOneHzClock();
 }
 
 void pianolaManagerCore1(void)
@@ -668,12 +833,6 @@ void main(void)
 
     stdio_init_all();
 
-    // Red and Green channels of the status LED
-    gpio_init(STATUS_LED_GREEN);
-    gpio_set_dir(STATUS_LED_GREEN, true);
-    gpio_init(STATUS_LED_BLUE);
-    gpio_set_dir(STATUS_LED_BLUE, true);
-
     // create queues to store commands we want to shuffle between cores
     // commandQ stores a single char array of 32 bytes containing data received over UART
     // responseQ stores a single 32byte char array which will contain the reponse to any command.
@@ -693,8 +852,10 @@ void main(void)
 
     // claim state machines for the pio programs
     //pinDriver
-    uint pinSpan = ONBOARD_LED_PIN - OUTPUT_0_PIN + 1;
-    uint32_t outputGpioMask = remapPinMask(UINT8_MAX) << OUTPUT_0_PIN;
+    uint pinSpan = STATUS_LED_BLUE - OUTPUT_0_PIN + 1;
+    uint32_t outputGpioMask = 0;
+    for (uint pin = 0; pin < count_of(pianolaOutputs); pin++)
+        outputGpioMask |= 1u << pianolaOutputs[pin].gpio;
     bool pioTriggerStart = pio_claim_free_sm_and_add_program_for_gpio_range(&pinDriver_program, &pioBlock, &smPinDriver, &offsetPinDriver, OUTPUT_0_PIN, pinSpan, false);
     // pianolaClock
     bool pioClockStart = pio_claim_free_sm_and_add_program(&pianolaClock_program, &pioBlock, &smPianolaClock, &offsetPianolaClock);
@@ -703,6 +864,7 @@ void main(void)
     // initialise the state machines but dont start yet
     pinDriver_program_init(pioBlock, smPinDriver, offsetPinDriver, OUTPUT_0_PIN, pinSpan, outputGpioMask, pinDriverClockDivisorFP);
     pianolaClock_program_init(pioBlock, smPianolaClock, offsetPianolaClock, pianolaClockDivisorFP);
+    resetPinSources();
 
     // start both state machines in sync
     pio_enable_sm_mask_in_sync(pioBlock, (1ULL << smPinDriver)|(1ULL << smPianolaClock));
