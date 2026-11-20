@@ -98,7 +98,7 @@ Call: CMD, final address = 2 bytes. Response: none.
 
 ### SET_PianolaRepeatFrom => 0x03
 
-Sets the pianola repeat address: the first pass starts at zero, later passes start here. Repeating can be stopped using SET_PianolaRepeating. The repeat address must not exceed the final address. Invalid ranges are not currently rejected and can leave playback marked active without producing entries; shortening a sequence during playback can also create this condition.
+Sets the pianola repeat address: the first pass starts at zero, later passes start here. Repeating can be stopped using SET_PianolaRepeating. At each repeat boundary, the repeat address is checked against the final address. If it exceeds final, playback finishes the current pass without repeating, becomes READY after the active/queued work completes, and retains the final output pattern. The stored repeat settings are preserved; they are not clamped or rewritten. Validation is deferred until use so uploads can set the repeat address before the final address, and live edits that shorten the sequence cannot strand playback.
 
 Call: CMD, repeat address = 2 bytes. Response: none.
 

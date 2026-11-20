@@ -187,10 +187,61 @@ static void test_repeat_off(void) {
     CHECK(pianolaStatus==READY && pianolaPosition==0 && fifo_level==0,
           "Disabling repetition did not finish playback after the repeat pass");
 }
+static uint32_t output_levels(void);
+static void finish_and_expect_ready(const char *where, unsigned last_mask) {
+    CHECK(fifo_level==0,"%s: invalid repeat queued a successor",where);
+    step();
+    CHECK(pianolaStatus==RUNNING || pianolaStatus==REPEATING,"%s: ready before active final entry completed",where);
+    active=false;driver_pc=driver_wait_pc;step();
+    CHECK(pianolaStatus==READY && pianolaPosition==0 && fifo_level==0,"%s: did not finish at READY",where);
+    CHECK(output_levels()==(expected_mask(last_mask)<<2),"%s: changed final pattern instead of natural completion",where);
+    for(unsigned i=0;i<10;i++) step();
+    CHECK(!fifo_level && pianolaStatus==READY,"%s: stopped sequence spontaneously repeated",where);
+}
 static void test_invalid_repeat(void) {
     entry(0,1,4);SEND(2,0);SEND(3,255);SEND(4,1);run();expect_next(1,4,"Invalid-repeat first entry");
-    for(unsigned i=0;i<12;i++) step();
-    CHECK(pianolaStatus!=RUNNING && pianolaStatus!=REPEATING,"Repeat address beyond final entry leaves firmware stuck in active state");
+    finish_and_expect_ready("Invalid repeat beyond final",1);
+    CHECK(pianolaRepeatFlag==1 && pianolaRepeatAddr==255,"Boundary validation should not rewrite uploaded settings");
+    SEND(0xFD);CHECK(tx_count>=2 && tx[tx_count-2]==6 && tx[tx_count-1]==6,"Invalid repeat prevented further command service");
+}
+static void test_invalid_repeat_boundaries(void) {
+    const unsigned finals[]={0,1,127,254};
+    for(unsigned f=0;f<count_of(finals);f++) for(unsigned variant=0;variant<2;variant++) {
+        SEND(7);unsigned final=finals[f];
+        for(unsigned i=0;i<=final;i++) entry(i,(i+1)&31,4);
+        SEND(2,final);SEND(3,variant?255:final+1);SEND(4,1);run();
+        for(unsigned i=0;i<=final;i++) expect_next((i+1)&31,4,"Invalid-repeat boundary matrix");
+        finish_and_expect_ready("Invalid-repeat boundary matrix",(final+1)&31);
+    }
+}
+static void test_repeat_before_final_upload(void) {
+    // A temporarily invalid configuration while stopped is a valid upload order.
+    entry(0,1,4);entry(1,2,8);entry(2,4,16);
+    SEND(3,2);SEND(4,1);SEND(2,2);run();
+    expect_next(1,4,"Upload-order prefix zero");expect_next(2,8,"Upload-order prefix one");
+    for(unsigned i=0;i<4;i++) expect_next(4,16,"RepeatFrom preserved until final supplied");
+}
+static void test_live_repeat_range_invalidation(void) {
+    entry(0,1,4);entry(1,2,8);entry(2,4,16);SEND(2,2);SEND(3,1);SEND(4,1);run();
+    expect_next(1,4,"Live repeat edit prefix");SEND(3,255);
+    expect_next(2,8,"Live repeat edit remaining entry one");expect_next(4,16,"Live repeat edit final entry");
+    finish_and_expect_ready("Repeat address invalidated while playing",4);
+}
+static void test_shrink_final_during_repeat(void) {
+    entry(0,1,4);entry(1,2,8);entry(2,4,16);SEND(2,2);SEND(3,2);SEND(4,1);run();
+    expect_next(1,4,"Shrink prefix zero");expect_next(2,8,"Shrink prefix one");expect_next(4,16,"Shrink prefix end");
+    expect_next(4,16,"Establish active repeat section");CHECK(pianolaStatus==REPEATING,"Expected repeating state before shrinking final");
+    SEND(2,1);
+    // The old entry is already active: let it finish; do not jump to entry zero.
+    finish_and_expect_ready("Final shortened below repeat address",4);
+    run();expect_next(1,4,"Restart shortened sequence zero");expect_next(2,8,"Restart shortened sequence final");
+    finish_and_expect_ready("Restart with still-invalid repeat configuration",2);
+}
+static void test_repair_repeat_range_before_boundary(void) {
+    entry(0,1,4);entry(1,2,8);SEND(2,1);SEND(3,255);SEND(4,1);run();
+    expect_next(1,4,"Repair prefix");expect_next(2,8,"Repair final entry");step();
+    SEND(3,1);
+    for(unsigned i=0;i<4;i++) expect_next(2,8,"Repaired configuration repeats normally");
 }
 static void test_stop_pending(void) {
     fake_time=100;step();SEND(6,0,4,0);SEND(7);fake_time=1024;step();CHECK(fifo_level==0 && !pianolaFirePending,"Stop failed to cancel scheduled start");
@@ -593,6 +644,11 @@ static const test tests[]={
  {"repeat_section","Playback / prefix then nonzero repeat section",test_repeat},
  {"single_entry_repeat","Playback / bounded sampling of an endless one-entry loop",test_single_repeat},
  {"disable_repeat","Playback / disabling an already active loop",test_repeat_off},
+ {"invalid_repeat_boundaries","Safety / invalid repeat at final+1 and 255 across sequence sizes",test_invalid_repeat_boundaries},
+ {"repeat_upload_order","Playback / repeat address before final position is preserved",test_repeat_before_final_upload},
+ {"live_repeat_invalidation","Safety / invalid repeat edit finishes current pass",test_live_repeat_range_invalidation},
+ {"live_final_shrink","Safety / shrinking final while repeating does not strand playback",test_shrink_final_during_repeat},
+ {"repair_repeat_range","Playback / repair invalid range before the boundary",test_repair_repeat_range_before_boundary},
  {"invalid_repeat_range","Safety / repeat position beyond final entry",test_invalid_repeat},
  {"stop_pending","Control / stop cancels pending start",test_stop_pending},
  {"stop_queued","Control / stop cancels queued successor",test_stop_queued},

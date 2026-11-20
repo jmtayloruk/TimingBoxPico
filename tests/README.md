@@ -157,8 +157,11 @@ hold it indefinitely with the output SM disabled. This includes a nonzero entry
 zero and stop after natural completion. It deliberately differs from XMOS, which
 retains the last applied pianola pattern. Hard reset must cancel active/queued
 work, drive outputs low, clear stored entries and reset sequence/repeat/pending,
-camera-clock and PIV settings, without resetting the independent clock. Invalid repeat ranges must not leave playback stuck
-active indefinitely; rejecting/clamping/stopping are all possible solutions.
+camera-clock and PIV settings, without resetting the independent clock. An invalid
+repeat range finishes the current pass naturally, retaining its final pattern
+and stored repeat settings; it does not invoke the entry-zero-freezing stop
+command. Validation is at the boundary, allowing repeatFrom before final during
+upload and handling live invalidation.
 
 The refill timing experiments use **requested durations and an assumed four-tick
 manager servicing interval**, with an adversarial phase. A long entry surrounds
@@ -409,3 +412,16 @@ See [Timing model and known timebase mismatch](../README.md#timing-model-and-kno
 for the exact calculation and the unimplemented 12-cycle/integer-divider proposal.
 If that proposal is adopted, update the clock cycle expectations and this divider
 check together; do not suppress the warning without checking the new paths.
+
+## Invalid repeat-range validation
+
+At a repeat boundary, `repeatFrom > final` prevents another pass from being
+queued. Any in-flight work finishes, then playback becomes READY with the last
+pattern held. Stored configuration is retained: correcting the range allows a
+subsequent run to repeat, and correcting it before the current boundary is
+resolved can allow playback to continue. No PIO timing or instructions change.
+
+Native tests cover invalid final+1/255 positions, varied sequence sizes, valid
+repeat-before-final upload order, changing repeatFrom while active, shortening
+final during repetition, repairing the range and continued command service.
+Existing valid-repeat boundary tests include the full 256-entry range.

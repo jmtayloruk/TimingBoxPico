@@ -620,9 +620,12 @@ void pianolaManagerStep(void)
             queuePianolaEntry(pianolaPosition);
             pianolaPosition++;
         }
-        else if (pianolaRepeatFlag)
+        else if (pianolaRepeatFlag && pianolaRepeatAddr <= pianolaFinalPosition)
         {
-            // Check the repeat flag at the end of every pass.
+            // Validate at the boundary, not when receiving configuration:
+            // uploads may set repeatFrom before final, and live edits can
+            // invalidate a previously valid range. Invalid ranges finish the
+            // current pass normally, retaining its final pattern and settings.
             pianolaStatus = REPEATING;
             pianolaPosition = pianolaRepeatAddr;
         }
