@@ -2,6 +2,35 @@
 
 This is the repository for (almost) all things related to the Raspberry Pi Pico powered timing boxes that are used by the [SPIM and spimGUI](https://github.com/jmtayloruk/spim-interface.git) to schedule the triggering of cameras and lasers etc for prospective optical gating. These pico based timing boxes implement a subset of the existing xmos-xs1 timing box protocol, with 4 BNC outputs and the onboard LED. The current host software also has a dedicated Pico timing-box type. Two of the outputs are permanently wired to a $10k\Omega$ impedance, and two are switchable between the high impedance ($10k\Omega$) mode and a low impedance mode ($50\Omega$) via a pair of switches in side the timing box. We originally had 10 units produced by European circuits however due to some mis-communications they need to be modified to be full operational (see the [hardware modification notes](timingBoxModicationInstructions.md))
 
+This document mostly written by Daniel Geddes, with some subsequent edits by AI
+
+## Jonny quick notes on building the firmware
+Build and reflash:
+
+	cmake --build TimingBoxPico/build
+	picotool load -v -x TimingBoxPico/build/picoTimingBoxFirmware.uf2
+
+Skipping the need for BOOTSEL, with a special build variant:
+
+	picotool load -f -v -x TimingBoxPico/build/usb-flashing/picoTimingBoxFirmware.uf2
+
+
+To monitor printf output over serial:
+- Enable serial output over USB in CMakeLists.txt
+- Run `screen /dev/cu.usbmodem1101 115200`
+
+To test offline:
+
+	python3 TimingBoxPico/tests/run_tests.py
+
+Current status: 72 passed; 0 functional failures; 1 timing warnings.
+
+To test with hardware:
+
+	python3 TimingBoxPico/tests/hardware_stress.py --interactive
+
+Currently: 13 PASS, 0 FAIL, 0 WARN, 0 SKIP
+
 ## The Pianola Concept
 
 To synchronise the triggering of different cameras, lasers, etc this means trigger pulse width and delay is dependent on what needs to be triggered. The timing box can be used like an old player piano (pianola) where sets of triggers can be programmed and played back to ensure we trigger a laser and cameras in synchrony.
